@@ -20,7 +20,11 @@ final class PlaybackState: ObservableObject {
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published var connected = false
+    @Published var connected = false {
+        didSet {
+            if oldValue && !connected { clearAccountContent() }
+        }
+    }
     @Published var busy = false
     @Published var error: String?
     @Published var query = "" {
@@ -28,7 +32,9 @@ final class AppModel: ObservableObject {
             if query != oldValue { scheduleSearch() }
         }
     }
-    @Published var shelves: [Shelf] = []
+    @Published var shelves: [Shelf] = [] {
+        didSet { prefetchHomeCollections() }
+    }
     var visibleHomeShelves: [Shelf] { HomeShelves.visible(in: shelves) }
     @Published var results: [MusicItem] = []
     @Published private(set) var searchLoading = false
@@ -53,16 +59,34 @@ final class AppModel: ObservableObject {
     private var collectionRevision = 0
     private var collectionTask: Task<MusicCollection, Error>?
     private let collectionLoader: ((MusicItem, Int) async throws -> MusicCollection)?
+    private let suppliedCollectionStore: CollectionStore?
+    private let feedLoader: (() async throws -> [Shelf])?
+    private var accountRevision = 0
+    private var prefetchShelfCount = 6
+    private var collectionRefreshing = false
+    private var collectionFailedOffset: Int?
+    private var collectionSnapshot = 0
+    private var collectionItem: MusicItem?
+    private lazy var collectionStore: CollectionStore = {
+        if let suppliedCollectionStore { return suppliedCollectionStore }
+        if let collectionLoader { return CollectionStore(directory: nil, loader: collectionLoader) }
+        let api = self.api
+        return CollectionStore { item, offset in try await api.collection(item, offset: offset) }
+    }()
 
     init(
         systemVolume: SystemVolumeControlling? = nil,
         searchLoader: ((String) async throws -> [MusicItem])? = nil,
         searchDelay: @escaping () async throws -> Void = { try await Task.sleep(for: .milliseconds(400)) },
-        collectionLoader: ((MusicItem, Int) async throws -> MusicCollection)? = nil
+        collectionLoader: ((MusicItem, Int) async throws -> MusicCollection)? = nil,
+        collectionStore: CollectionStore? = nil,
+        feedLoader: (() async throws -> [Shelf])? = nil
     ) {
         self.searchLoader = searchLoader
         self.searchDelay = searchDelay
         self.collectionLoader = collectionLoader
+        self.suppliedCollectionStore = collectionStore
+        self.feedLoader = feedLoader
         self.systemVolume = systemVolume ?? SystemVolume()
         let volume = self.systemVolume.snapshot
         playback.update(volume: volume.percent, volumeAvailable: volume.available)
@@ -79,14 +103,23 @@ final class AppModel: ObservableObject {
         error = nil
         status = "Waiting for Spotify sign-in…"
         defer { busy = false }
+        let connectionRevision = accountRevision
         do {
-            _ = try await engine.call("authenticate", timeout: 300)
+            let account = try await engine.call("authenticate", timeout: 300)
+            guard connectionRevision == accountRevision else { return }
+            await activateCollectionAccount(account["username"] as? String)
+            // activateCollectionAccount advances once. A disconnect while the
+            // disk cache is loading advances again and must abort this connect.
+            guard accountRevision == connectionRevision + 1 else { return }
             connected = true
             // System volume is the single gain control; avoid multiplying it by
             // the helper's default 50% software volume.
             _ = try await engine.call("volume", ["percent": 100])
             status = "Connected · this Mac"
-            shelves = try await api.madeForYou()
+            let revision = accountRevision
+            let loaded = try await loadFeed()
+            guard connected, revision == accountRevision else { return }
+            shelves = loaded
         } catch { self.error = error.localizedDescription; status = connected ? "Connected · feed unavailable" : "Could not connect" }
     }
 
@@ -95,22 +128,88 @@ final class AppModel: ObservableObject {
         busy = true
         error = nil
         defer { busy = false }
-        do { shelves = try await api.madeForYou(); status = "Connected · this Mac" }
-        catch is CancellationError {} catch { self.error = error.localizedDescription }
+        let revision = accountRevision
+        collectionStore.invalidate()
+        // Keep visible rows while replacing the first page. Never append to an
+        // old playlist snapshot after an explicit refresh.
+        let selected = collectionItem
+        cancelCollectionRequest()
+        let detailRevision = collectionRevision
+        if let selected {
+            Task { [weak self] in
+                guard let self, self.connected, revision == self.accountRevision,
+                      detailRevision == self.collectionRevision,
+                      self.collectionItem?.id == selected.id else { return }
+                await self.loadCollection(selected)
+            }
+        }
+        prefetchHomeCollections()
+        do {
+            let loaded = try await loadFeed()
+            guard connected, revision == accountRevision else { return }
+            shelves = loaded
+            status = "Connected · this Mac"
+        } catch is CancellationError {} catch {
+            guard connected, revision == accountRevision else { return }
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func loadFeed() async throws -> [Shelf] {
+        if let feedLoader { return try await feedLoader() }
+        return try await api.madeForYou()
+    }
+
+    func activateCollectionAccount(_ accountID: String?) async {
+        clearAccountContent()
+        if let accountID, !accountID.isEmpty {
+            await collectionStore.activate(accountID: accountID)
+        }
+    }
+
+    private func clearAccountContent() {
+        accountRevision += 1
+        collectionStore.reset()
+        invalidateSearch()
+        query = ""
+        closeCollection()
+        prefetchShelfCount = 6
+        shelves = []
+        nowPlaying = nil
+    }
+
+    /// Warm the first six displayed shelves, then one shelf ahead of scrolling.
+    func prefetchHomeCollections(approaching shelfID: String? = nil) {
+        guard connected else { return }
+        let visible = visibleHomeShelves
+        if let shelfID, let index = visible.firstIndex(where: { $0.id == shelfID }) {
+            prefetchShelfCount = max(prefetchShelfCount, index + 2)
+        }
+        collectionStore.prefetch(visible.prefix(prefetchShelfCount).flatMap(\.items))
+    }
+
+    func prefetchCollections(_ items: [MusicItem]) {
+        guard connected else { return }
+        collectionStore.prefetch(items)
     }
 
     func loadMore(_ shelf: Shelf) async {
         guard connected, !busy else { return }
         busy = true
         defer { busy = false }
+        let revision = accountRevision
         do {
             let page = try await api.moreItems(in: shelf)
+            guard connected, revision == accountRevision else { return }
             guard let index = shelves.firstIndex(where: { $0.id == shelf.id }) else { return }
             var seen = Set(shelves[index].items.map(\.id))
             shelves[index].items += (page?.items ?? []).filter { seen.insert($0.id).inserted }
             let next = page?.nextOffset
             shelves[index].nextOffset = (next ?? 0) > (shelf.nextOffset ?? 0) ? next : nil
-        } catch { self.error = error.localizedDescription }
+        } catch {
+            guard connected, revision == accountRevision else { return }
+            self.error = error.localizedDescription
+        }
     }
 
     func search() async {
@@ -187,13 +286,27 @@ final class AppModel: ObservableObject {
     func openCollection(_ item: MusicItem) async {
         closeCollection()
         guard connected else { return }
-        collectionLoading = true
+        collectionItem = item
+        // This assignment happens before any suspension or network request.
+        collection = collectionStore.cachedCollection(for: item)
+        collectionSnapshot = collectionStore.generation(for: item)
+        if collection != nil, collectionStore.isFresh(for: item) { return }
+        await loadCollection(item)
+    }
+
+    private func loadCollection(_ item: MusicItem) async {
+        guard connected, collectionItem?.id == item.id else { return }
+        collectionLoading = collection == nil
+        collectionRefreshing = true
+        collectionError = nil
+        collectionFailedOffset = nil
         let revision = collectionRevision
         let task = makeCollectionTask(item, offset: 0)
         collectionTask = task
         defer {
             if revision == collectionRevision {
                 collectionLoading = false
+                collectionRefreshing = false
                 collectionTask = nil
             }
         }
@@ -201,26 +314,60 @@ final class AppModel: ObservableObject {
             let result = try await task.value
             guard revision == collectionRevision, !task.isCancelled else { return }
             collection = result
+            collectionSnapshot = collectionStore.generation(for: item)
         } catch is CancellationError {} catch {
             guard revision == collectionRevision, !task.isCancelled else { return }
+            if error is SpotifyCollectionUnavailable { collection = nil }
             collectionError = error.localizedDescription
+            collectionFailedOffset = 0
         }
     }
 
-    func closeCollection() {
+    private func cancelCollectionRequest() {
         collectionRevision += 1
         collectionTask?.cancel()
         collectionTask = nil
-        collection = nil
         collectionLoading = false
+        collectionRefreshing = false
+    }
+
+    func closeCollection() {
+        cancelCollectionRequest()
+        collection = nil
+        collectionItem = nil
         collectionError = nil
+        collectionFailedOffset = nil
+    }
+
+    func retryCollection(_ item: MusicItem) async {
+        guard connected, collectionItem?.id == item.id else { return }
+        if let offset = collectionFailedOffset, offset > 0, collection != nil {
+            await loadMoreCollection()
+        } else {
+            cancelCollectionRequest()
+            await loadCollection(item)
+        }
+    }
+
+    func loadMoreCollectionIfNeeded(near trackID: String) async {
+        guard collectionError == nil, let current = collection,
+              current.tracks.suffix(10).contains(where: { $0.id == trackID }) else { return }
+        await loadMoreCollection()
     }
 
     func loadMoreCollection() async {
-        guard connected, !collectionLoading, let current = collection,
+        guard connected, !collectionLoading, !collectionRefreshing, let current = collection,
               let offset = current.nextOffset else { return }
+        // Offsets from an old first page cannot safely be combined with fresh
+        // continuation pages. Revalidate before proceeding after the TTL.
+        if !collectionStore.isFresh(for: current.item)
+            || collectionSnapshot != collectionStore.generation(for: current.item) {
+            await loadCollection(current.item)
+            return
+        }
         collectionLoading = true
         collectionError = nil
+        collectionFailedOffset = nil
         let revision = collectionRevision
         let task = makeCollectionTask(current.item, offset: offset)
         collectionTask = task
@@ -233,24 +380,38 @@ final class AppModel: ObservableObject {
         do {
             let page = try await task.value
             guard revision == collectionRevision, !task.isCancelled else { return }
+            if reconcileCollectionSnapshot(for: current.item) { return }
             var merged = current
             var seen = Set(current.tracks.map(\.id))
             merged.tracks += page.tracks.filter { seen.insert($0.id).inserted }
             merged.totalCount = page.totalCount ?? current.totalCount
             merged.nextOffset = page.nextOffset.flatMap { $0 > offset ? $0 : nil }
             collection = merged
-        } catch is CancellationError {} catch {
+        } catch is CancellationError {
             guard revision == collectionRevision, !task.isCancelled else { return }
+            // A refreshed first page cancels older continuation requests. Its
+            // cancellation is also a signal to replace the visible snapshot.
+            _ = reconcileCollectionSnapshot(for: current.item)
+        } catch {
+            guard revision == collectionRevision, !task.isCancelled else { return }
+            if error is SpotifyCollectionUnavailable { collection = nil }
             collectionError = error.localizedDescription
+            collectionFailedOffset = offset
         }
     }
 
+    private func reconcileCollectionSnapshot(for item: MusicItem) -> Bool {
+        let generation = collectionStore.generation(for: item)
+        guard collectionSnapshot != generation else { return false }
+        collection = collectionStore.cachedCollection(for: item)
+        collectionSnapshot = generation
+        return true
+    }
+
     private func makeCollectionTask(_ item: MusicItem, offset: Int) -> Task<MusicCollection, Error> {
-        let loader = collectionLoader
-        let api = self.api
+        let store = collectionStore
         return Task {
-            if let loader { return try await loader(item, offset) }
-            return try await api.collection(item, offset: offset)
+            try await store.collection(item, offset: offset)
         }
     }
 
@@ -281,6 +442,7 @@ final class AppModel: ObservableObject {
 
     func handleEvent(_ event: String, _ data: [String: Any]) {
         if event == "disconnected" || (event == "connection" && data["connected"] as? Bool == false) {
+            if !connected { clearAccountContent() }
             connected = false
             playback.update(isPlaying: false)
             status = "Disconnected"
@@ -308,5 +470,10 @@ final class AppModel: ObservableObject {
         if event == "error", let message = data["message"] as? String { error = message }
     }
 
-    func shutdown() { invalidateSearch(); closeCollection(); systemVolume.stop(); engine.shutdown() }
+    func shutdown() {
+        connected = false
+        clearAccountContent()
+        systemVolume.stop()
+        engine.shutdown()
+    }
 }

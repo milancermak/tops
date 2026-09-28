@@ -80,4 +80,33 @@ final class SpotifyAuthorizationTests: XCTestCase {
         XCTAssertEqual(refreshes, [false])
         XCTAssertEqual(SpotifyStubProtocol.requestCount, 1)
     }
+
+    func testRateLimitIsTypedAndCooldownPreventsAnotherRequest() async {
+        SpotifyStubProtocol.reset([429, 200])
+        let session = session()
+        defer { session.invalidateAndCancel() }
+        let api = SpotifyAPI(session: session, operations: ["searchDesktop": String(repeating: "a", count: 64)]) { _ in
+            ["access_token": "fixture", "client_token": "fixture"]
+        }
+        for _ in 0..<2 {
+            do { _ = try await api.search("fixture"); XCTFail("Expected rate limit") }
+            catch {
+                XCTAssertNotNil(error as? SpotifyRateLimited)
+                XCTAssertGreaterThan((error as? SpotifyRateLimited)?.retryAfter ?? 0, 0)
+            }
+        }
+        XCTAssertEqual(SpotifyStubProtocol.requestCount, 1, "A cooling-down prefetch must not hit Spotify again")
+    }
+
+    func testMissingCollectionHasTypedUnavailability() async {
+        SpotifyStubProtocol.reset([404])
+        let session = session()
+        defer { session.invalidateAndCancel() }
+        let api = SpotifyAPI(session: session, operations: ["fetchPlaylist": String(repeating: "a", count: 64)]) { _ in
+            ["access_token": "fixture", "client_token": "fixture"]
+        }
+        let item = MusicItem(id: "spotify:playlist:gone", title: "Gone", subtitle: "", imageURL: nil, kind: "playlist")
+        do { _ = try await api.collection(item); XCTFail("Expected unavailable collection") }
+        catch { XCTAssertTrue(error is SpotifyCollectionUnavailable) }
+    }
 }

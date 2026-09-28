@@ -74,6 +74,15 @@ final class SpotifyCollectionParserTests: XCTestCase {
         }
     }
 
+    func testOnlyConfirmedUnavailabilityEvictsCachedContent() {
+        for typename in ["NotFound", "RestrictedContent", "GenericError", "UnexpectedShape"] {
+            let response: [String: Any] = ["data": ["playlistV2": ["__typename": typename]]]
+            XCTAssertThrowsError(try SpotifyParser.collection(response, for: item("playlist"), offset: 0)) { error in
+                XCTAssertEqual(error is SpotifyCollectionUnavailable, ["NotFound", "RestrictedContent"].contains(typename))
+            }
+        }
+    }
+
     func testExplicitEndOfPagePreventsFurtherPagingDespiteTotalCount() throws {
         let response: [String: Any] = ["data": ["albumUnion": [
             "__typename": "Album", "tracksV2": ["items": [["track": track()]], "totalCount": 9, "pagingInfo": ["nextOffset": NSNull()]]

@@ -305,6 +305,7 @@ struct ContentView: View {
                                 }
                                 itemGrid(shelf.items)
                             }
+                            .onAppear { model.prefetchHomeCollections(approaching: shelf.id) }
                         }
                     }
                     .padding(.horizontal, MusicLayout.contentInset)
@@ -352,6 +353,7 @@ struct ContentView: View {
                                     }
                                 } else {
                                     itemGrid(section.items)
+                                        .onAppear { model.prefetchCollections(section.items) }
                                 }
                             }
                         }
@@ -439,11 +441,7 @@ struct ContentView: View {
                         Button("Retry") {
                             Task {
                                 guard selectedCollection?.id == selected.id else { return }
-                                if collection?.nextOffset != nil {
-                                    await model.loadMoreCollection()
-                                } else {
-                                    await model.openCollection(selected)
-                                }
+                                await model.retryCollection(selected)
                             }
                         }
                         .disabled(model.collectionLoading)
@@ -458,6 +456,9 @@ struct ContentView: View {
                             TrackRow(item: track.musicItem, isCurrent: model.nowPlaying?.id == track.uri,
                                      durationMS: track.durationMS, isPlayable: track.isPlayable) {
                                 Task { await model.play(track.musicItem) }
+                            }
+                            .onAppear {
+                                Task { await model.loadMoreCollectionIfNeeded(near: track.id) }
                             }
                         }
                     }

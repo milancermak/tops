@@ -1,6 +1,6 @@
 import Foundation
 
-struct MusicItem: Identifiable, Hashable {
+struct MusicItem: Identifiable, Hashable, Codable, Sendable {
     var id: String
     var title: String
     var subtitle: String
@@ -16,14 +16,14 @@ struct Shelf: Identifiable {
     var pagingKind: String = "browse"
 }
 
-struct MusicCollection {
+struct MusicCollection: Codable, Sendable {
     var item: MusicItem
     var tracks: [CollectionTrack]
     var totalCount: Int?
     var nextOffset: Int?
 }
 
-struct CollectionTrack: Identifiable, Hashable {
+struct CollectionTrack: Identifiable, Hashable, Codable, Sendable {
     var id: String
     var uri: String
     var title: String
@@ -139,6 +139,9 @@ enum SpotifyParser {
             throw TopsError(message: "This item does not have a supported track list in Tops.")
         }
         let expectedType = requested.kind.prefix(1).uppercased() + requested.kind.dropFirst()
+        if let type = node["__typename"] as? String, ["NotFound", "RestrictedContent"].contains(type) {
+            throw SpotifyCollectionUnavailable()
+        }
         guard node["__typename"] as? String == expectedType,
               let rawItems = page["items"] as? [Any] else {
             throw TopsError(message: "Spotify did not return a readable \(requested.kind) track list. This item may be unavailable or unsupported.")

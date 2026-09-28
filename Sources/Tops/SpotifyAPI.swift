@@ -1,5 +1,16 @@
 import Foundation
 
+struct SpotifyCollectionUnavailable: LocalizedError {
+    var errorDescription: String? { "This collection is no longer available to your Spotify account." }
+}
+
+struct SpotifyRateLimited: LocalizedError {
+    let retryAfter: TimeInterval
+    var errorDescription: String? {
+        "Spotify asked us to slow down. Try again in \(Int(ceil(max(1, retryAfter)))) seconds."
+    }
+}
+
 @MainActor
 final class SpotifyAPI {
     private let authorization: (Bool) async throws -> [String: Any]
@@ -139,7 +150,7 @@ final class SpotifyAPI {
 
     private func request(_ operation: String, variables: [String: Any], forceRefresh: Bool = false) async throws -> [String: Any] {
         if cooldownUntil > Date() {
-            throw TopsError(message: "Spotify asked us to slow down. Try again in \(Int(ceil(cooldownUntil.timeIntervalSinceNow))) seconds.")
+            throw SpotifyRateLimited(retryAfter: cooldownUntil.timeIntervalSinceNow)
         }
         let hash = try operationHash(operation)
         try Task.checkCancellation()
@@ -155,7 +166,7 @@ final class SpotifyAPI {
         if http.statusCode == 429 {
             let seconds = max(1, Double(http.value(forHTTPHeaderField: "Retry-After") ?? "60") ?? 60)
             cooldownUntil = Date().addingTimeInterval(seconds)
-            throw TopsError(message: "Spotify is rate limiting requests. Please wait \(Int(seconds)) seconds.")
+            throw SpotifyRateLimited(retryAfter: seconds)
         }
         if http.statusCode == 401 && !forceRefresh {
             // Retry this read once with a fresh grant; a 403 never clears a valid sign-in.
@@ -163,6 +174,10 @@ final class SpotifyAPI {
         }
         if let failure = SpotifyAPIError.authorizationFailure(status: http.statusCode, operation: operation) {
             throw failure
+        }
+        if [404, 410].contains(http.statusCode),
+           ["fetchPlaylist", "getAlbum", "queryArtistOverview"].contains(operation) {
+            throw SpotifyCollectionUnavailable()
         }
         guard (200..<300).contains(http.statusCode) else { throw TopsError(message: "Spotify request failed (HTTP \(http.statusCode)).") }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw TopsError(message: "Spotify returned an unreadable response.") }

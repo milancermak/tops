@@ -43,7 +43,11 @@ The app has two sections:
 - **Made for You:** reads Spotify's actual internal personalized browse hub;
   **Show more** pages through additional items in a shelf. The Home button returns
   here from search or collection details. Discover New Music and Your Daily Mixes
-  lead the page; Watch What You Love is hidden.
+  lead the page; Watch What You Love is hidden. Tops prefetches the first 50 tracks
+  of each distinct collection in the first six displayed sections, then warms
+  another section ahead as you scroll. Visible search collection sections are
+  prefetched too. At most two collection requests run together; opening a
+  collection takes priority over queued background work.
 - **Search:** searches songs, albums, artists and playlists, with the first 20
   results per category. Search starts 400ms after the last edit; Return submits
   immediately. The first seven songs appear with larger covers and a centered
@@ -52,11 +56,28 @@ The app has two sections:
 
 Collection covers animate from the clicked card to the top-left detail header in
 240ms, with an immediate image handoff that avoids a second fade;
-Reduce Motion skips the movement. Collection details show track names, artists and durations, with **Show more
-songs** for additional playlist/album pages. Back restores the preceding search
+Reduce Motion skips the movement. Collection details show track names, artists and durations;
+additional playlist/album pages load near the end of the current rows, with
+**Show more songs** available as well. Back restores the preceding search
 or Made for You view. **Play** starts the collection's playback queue; clicking
 an individual row currently starts that song on its own. Empty collections do
 not enable Play. Artist details contain Spotify's top tracks, not a full discography.
+
+Collection pages are cached in memory and in `~/Library/Caches/Tops/Collections`,
+separately for each authenticated account. Fresh cached details open without a
+content request. Pages are fresh for 15 minutes; older pages render immediately
+while a refresh runs, and entries older than seven days are discarded. **Refresh**
+(Cmd-R) invalidates freshness and reloads the current detail and prefetched shelves.
+Temporary errors keep cached rows; confirmed unavailable/restricted collections
+are removed. The cache holds at most 500 pages per account and contains track
+metadata, never audio or credentials. Artwork has its own separate cache.
+
+Refreshing the first page discards that collection's cached continuation pages
+and rejects their outstanding responses. No verified server playlist revision is
+available, so changes made in Spotify become visible after the next successful refresh;
+pagination cannot guarantee a consistent server snapshot across external edits.
+Disconnecting clears in-memory account data and cancels outstanding content work.
+Cache files use a schema version so incompatible formats are ignored safely.
 
 The player supports play/pause, previous/next, seek and macOS system volume.
 The volume slider and system output volume follow each other, including mute and
@@ -173,6 +194,12 @@ Verified on September 28, 2026 with Swift 6.2.4 and Rust 1.98.1 on Apple Silicon
 a clean source-only copy built and passed app-signature verification; 49 Swift,
 five Rust, and six Python tests passed, as did the engine protocol smoke check.
 The clean build used cached dependency downloads but no existing build products.
+
+The September 28 collection-cache follow-up passed 74 Swift tests, including
+account isolation, persistent-cache hydration, invalidation, prefetch scheduling,
+and pagination/refresh races. The release app was rebuilt and its signature
+verified. Prefetch latency and request counts have not been measured against the
+live account in this follow-up; cache-hit tests verify that no content loader runs.
 
 ### Working on Tops, including with an agent
 
