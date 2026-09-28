@@ -1,0 +1,19 @@
+.build/
+.tools/
+.private/
+dist/
+engine/target/
+output/
+.DS_Store
+*.log
+__pycache__/
+*.py[cod]
+.swiftpm/
+.env
+.env.*
+!.env.example
+# Local Spotify credentials, including custom TOPS_DATA_DIR locations.
+session/
+oauth.json
+credentials.json
+device-id

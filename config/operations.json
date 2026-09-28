@@ -1,0 +1,140 @@
+{
+  "endpoint": "https://api-partner.spotify.com/pathfinder/v2/query",
+  "captured_at": "2026-09-27T17:33:30+00:00",
+  "provenance": "Extracted from public Spotify web-player assets; no authenticated requests were made.",
+  "sources": [
+    {
+      "url": "https://open.spotify.com/",
+      "sha256": "8f284888342486a45c9e9cb842624719fd50c849b394c490d676e45e4cc8b46a",
+      "bytes": 163848
+    },
+    {
+      "url": "https://open.spotifycdn.com/cdn/build/web-player/encore~web-player.12a0f55e.js",
+      "sha256": "8538da87bb99eceee087a0b28f7161216e16e3feba75d536b4d34e4160ac086c",
+      "bytes": 557691
+    },
+    {
+      "url": "https://open.spotifycdn.com/cdn/build/web-player/vendor~web-player.4ad2b3e0.js",
+      "sha256": "375a6b8f1cadebd142ac251fecb90b7f6055ce64163a01407b972d1d1e018ce4",
+      "bytes": 1574484
+    },
+    {
+      "url": "https://open.spotifycdn.com/cdn/build/web-player/web-player.da8b87c8.js",
+      "sha256": "0f019803dc443590b89d6527f58b63ce4c63845310d6de02385f81472c7e8ea5",
+      "bytes": 4372063
+    },
+    {
+      "url": "https://open.spotifycdn.com/cdn/build/web-player/browse-v2.fe930758.js",
+      "sha256": "035d35b54f8e7e45ddb941250ea0d32dd2807201fd2f69696f811ddc1811506d",
+      "bytes": 32780
+    },
+    {
+      "url": "https://open.spotifycdn.com/cdn/build/web-player/home-v2-section.170ae6e7.js",
+      "sha256": "33389a7b80fec2a1c84631a40b8ecbb215e387cb21e338bbc1ae91f6b9c6bd8e",
+      "bytes": 26759
+    },
+    {
+      "url": "https://open.spotifycdn.com/cdn/build/web-player/xpui-routes-search.96d81afe.js",
+      "sha256": "532e0bf57b448c2b8e925ee498f98eb27d51ee09bf52dea8b660ee29e6795623",
+      "bytes": 80755
+    }
+  ],
+  "operations": {
+    "browsePage": {
+      "hash": "f5c4e6d668f5716464a231c1cc8b22c1cbf6ad68b09929fd7de813a30581298b",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/browse-v2.fe930758.js"
+      ]
+    },
+    "browseSection": {
+      "hash": "b13c1cccbfcb6947753c2613411b3566485c21fd5f36d80a80bb64be61ba2d51",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/browse-v2.fe930758.js"
+      ]
+    },
+    "fetchPlaylist": {
+      "hash": "243c0ba2736f16da721e3a227004bbcdb8df6c846f198bd478172e00aa1faf42",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/web-player.da8b87c8.js"
+      ]
+    },
+    "fetchPlaylistContents": {
+      "hash": "243c0ba2736f16da721e3a227004bbcdb8df6c846f198bd478172e00aa1faf42",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/web-player.da8b87c8.js"
+      ]
+    },
+    "fetchPlaylistMetadata": {
+      "hash": "243c0ba2736f16da721e3a227004bbcdb8df6c846f198bd478172e00aa1faf42",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/web-player.da8b87c8.js"
+      ]
+    },
+    "getAlbum": {
+      "hash": "6a74b456cd1735c9193d9e8ec8cc5184cad7ce13572210315229db3975964361",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/web-player.da8b87c8.js"
+      ]
+    },
+    "getTrack": {
+      "hash": "a8ef9e9f02b836feb0da3003c31dbb30decc6f4b473ef89ca88c882386d668de",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/web-player.da8b87c8.js"
+      ]
+    },
+    "home": {
+      "hash": "76243c78b0e20ecdbe41b794dec8cbe73f75e585b0a7201b8d2e84578412847a",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/web-player.da8b87c8.js"
+      ]
+    },
+    "homeSection": {
+      "hash": "76243c78b0e20ecdbe41b794dec8cbe73f75e585b0a7201b8d2e84578412847a",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/web-player.da8b87c8.js"
+      ]
+    },
+    "queryAlbumTracks": {
+      "hash": "6a74b456cd1735c9193d9e8ec8cc5184cad7ce13572210315229db3975964361",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/web-player.da8b87c8.js"
+      ]
+    },
+    "queryArtistOverview": {
+      "hash": "9f8134ef565e78621f1e1793555bd6633c5ac144ae0f89604ed3ae3f80b3c8e6",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/web-player.da8b87c8.js"
+      ]
+    },
+    "searchAlbums": {
+      "hash": "202cb3305e31e5a0767ba7925f28bd728cf8f8b0217e6da43909056071cd70e9",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/xpui-routes-search.96d81afe.js"
+      ]
+    },
+    "searchArtists": {
+      "hash": "7bf95d754fdbe32c8b161fbbe54d1ae50974900df4dce4c8f1afcbcad153224d",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/xpui-routes-search.96d81afe.js"
+      ]
+    },
+    "searchDesktop": {
+      "hash": "1148393611bbc58e84e47aed35ecc731275df9f9eb660956962e352dd3631d89",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/xpui-routes-search.96d81afe.js"
+      ]
+    },
+    "searchPlaylists": {
+      "hash": "d520014e748f9ea44f7707d8df1819867ac1205e8b7f3e28f22fe5fc858921b1",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/xpui-routes-search.96d81afe.js"
+      ]
+    },
+    "searchTracks": {
+      "hash": "b02683192a98dde7966b5e6655a79eeb62713eab703eda9902c932818dd52751",
+      "sources": [
+        "https://open.spotifycdn.com/cdn/build/web-player/xpui-routes-search.96d81afe.js"
+      ]
+    }
+  }
+}
