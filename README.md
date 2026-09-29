@@ -82,11 +82,18 @@ Cache files use a schema version so incompatible formats are ignored safely.
 The player supports play/pause, previous/next, seek and macOS system volume.
 The volume slider and system output volume follow each other, including mute and
 output-device changes. Devices without writable system volume disable the slider.
+The playback engine starts at full internal volume, so its startup gain does not
+attenuate the audio a second time before macOS output volume is applied.
 Plain Space toggles
 play/pause outside text editing and focused native controls; key repeats and
 modified Space presses are ignored. Cmd-F focuses search; Cmd-R refreshes
 recommendations. Closing the window quits the app and its playback process.
-Search pagination, automatic reconnect, media keys, offline playback, shuffle
+The keyboard's previous, play/pause and next media keys work through macOS Now
+Playing, including while Tops is in the background. Start a track in Tops first;
+macOS decides which media app receives the keys when several apps are open.
+Playback metadata and controls clear when Tops disconnects or quits. No
+Accessibility or Input Monitoring permission is needed.
+Search pagination, automatic reconnect, offline playback, shuffle
 and repeat are not implemented.
 
 The bottom player arranges track information, transport buttons, progress and

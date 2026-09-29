@@ -23,6 +23,7 @@ final class AppModel: ObservableObject {
     @Published var connected = false {
         didSet {
             if oldValue && !connected { clearAccountContent() }
+            updateMediaControls()
         }
     }
     @Published var busy = false
@@ -47,7 +48,8 @@ final class AppModel: ObservableObject {
     // Progress ticks only invalidate views observing playback, not the library.
     let playback = PlaybackState()
 
-    private let engine = EngineClient()
+    private let engine: EngineClient
+    private var mediaControls: MediaControlSystem?
     private let systemVolume: SystemVolumeControlling
     private lazy var api = SpotifyAPI(engine: engine)
     private var searchRevision = 0
@@ -75,6 +77,7 @@ final class AppModel: ObservableObject {
     }()
 
     init(
+        engine: EngineClient? = nil,
         systemVolume: SystemVolumeControlling? = nil,
         searchLoader: ((String) async throws -> [MusicItem])? = nil,
         searchDelay: @escaping () async throws -> Void = { try await Task.sleep(for: .milliseconds(400)) },
@@ -82,6 +85,7 @@ final class AppModel: ObservableObject {
         collectionStore: CollectionStore? = nil,
         feedLoader: (() async throws -> [Shelf])? = nil
     ) {
+        self.engine = engine ?? EngineClient()
         self.searchLoader = searchLoader
         self.searchDelay = searchDelay
         self.collectionLoader = collectionLoader
@@ -93,7 +97,33 @@ final class AppModel: ObservableObject {
         self.systemVolume.onChange = { [weak self] volume in
             self?.playback.update(volume: volume.percent, volumeAvailable: volume.available)
         }
-        engine.onEvent = { [weak self] event, data in self?.handleEvent(event, data) }
+        self.engine.onEvent = { [weak self] event, data in self?.handleEvent(event, data) }
+    }
+
+    func startMediaControls(system: MediaControlSystem? = nil) {
+        guard mediaControls == nil else { return }
+        let controls = system ?? NativeMediaControlSystem()
+        mediaControls = controls
+        controls.onCommand = { [weak self] action in
+            guard let self, self.connected, self.nowPlaying != nil else { return }
+            switch action {
+            case .play: await self.command("resume")
+            case .pause: await self.command("pause")
+            case .togglePlayPause: await self.togglePlayback()
+            case .previous: await self.previous()
+            case .next: await self.next()
+            }
+        }
+        updateMediaControls()
+    }
+
+    private func updateMediaControls() {
+        guard connected, let item = nowPlaying else {
+            mediaControls?.update(nil)
+            return
+        }
+        mediaControls?.update(.init(item: item, isPlaying: playback.isPlaying,
+                                   positionMS: playback.positionMS, durationMS: playback.durationMS))
     }
 
     func connect() async {
@@ -112,9 +142,6 @@ final class AppModel: ObservableObject {
             // disk cache is loading advances again and must abort this connect.
             guard accountRevision == connectionRevision + 1 else { return }
             connected = true
-            // System volume is the single gain control; avoid multiplying it by
-            // the helper's default 50% software volume.
-            _ = try await engine.call("volume", ["percent": 100])
             status = "Connected · this Mac"
             let revision = accountRevision
             let loaded = try await loadFeed()
@@ -176,6 +203,7 @@ final class AppModel: ObservableObject {
         prefetchShelfCount = 6
         shelves = []
         nowPlaying = nil
+        updateMediaControls()
     }
 
     /// Warm the first six displayed shelves, then one shelf ahead of scrolling.
@@ -421,6 +449,7 @@ final class AppModel: ObservableObject {
             _ = try await engine.call("play", ["uri": item.id])
             if nowPlaying != item { nowPlaying = item }
             playback.update(positionMS: 0, durationMS: 0)
+            updateMediaControls()
             error = nil
         } catch { self.error = error.localizedDescription }
     }
@@ -466,11 +495,14 @@ final class AppModel: ObservableObject {
                         ?? MusicItem(id: uri, title: "Playing on this Mac", subtitle: "Spotify", imageURL: nil, kind: "track")
                 }
             }
+            updateMediaControls()
         }
         if event == "error", let message = data["message"] as? String { error = message }
     }
 
     func shutdown() {
+        mediaControls?.stop()
+        mediaControls = nil
         connected = false
         clearAccountContent()
         systemVolume.stop()

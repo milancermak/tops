@@ -119,6 +119,23 @@ fn token_needs_refresh(expires_at: u64, current_time: u64, force_refresh: bool) 
     force_refresh || expires_at <= current_time.saturating_add(120)
 }
 
+fn connect_config() -> ConnectConfig {
+    ConnectConfig {
+        name: "Tops".to_owned(),
+        device_type: DeviceType::Computer,
+        // Tops controls the macOS output volume. Start the software mixer at
+        // unity: Connect ignores volume commands until the device is active.
+        initial_volume: u16::MAX,
+        ..Default::default()
+    }
+}
+
+fn playback_mixer() -> Result<Arc<dyn mixer::Mixer>> {
+    Ok(mixer::find(None).context("Audio mixer missing")?(
+        MixerConfig::default(),
+    )?)
+}
+
 fn trim_memory() -> usize {
     #[cfg(target_os = "macos")]
     {
@@ -393,7 +410,7 @@ impl Engine {
             ..Default::default()
         };
         let session = Session::new(config, Some(cache));
-        let mixer = mixer::find(None).context("Audio mixer missing")?(MixerConfig::default())?;
+        let mixer = playback_mixer()?;
         let sink =
             audio_backend::find(Some("rodio".to_owned())).context("CoreAudio output missing")?;
         let player = Player::new(
@@ -408,20 +425,11 @@ impl Engine {
             move || sink(None, AudioFormat::default()),
         );
         let mut events = player.get_player_event_channel();
+        let connect_config = connect_config();
+        let initial_volume_percent = connect_config.initial_volume as f64 / u16::MAX as f64 * 100.0;
         let (spirc, spirc_task) = tokio::time::timeout(
             Duration::from_secs(35),
-            Spirc::new(
-                ConnectConfig {
-                    name: "Tops".to_owned(),
-                    device_type: DeviceType::Computer,
-                    initial_volume: 32768,
-                    ..Default::default()
-                },
-                session.clone(),
-                credentials,
-                player,
-                mixer,
-            ),
+            Spirc::new(connect_config, session.clone(), credentials, player, mixer),
         )
         .await
         .context("Spotify connection timed out")??;
@@ -475,7 +483,7 @@ impl Engine {
             let _ = output.send(json!({"event":"connection","data":{"connected":false}}));
         }));
         self.state.lock().unwrap().connected = true;
-        self.state.lock().unwrap().volume_percent = Some(50.0);
+        self.state.lock().unwrap().volume_percent = Some(initial_volume_percent);
         let result =
             json!({"connected":true,"username":session.username(),"device_id":self.device_id});
         self.session = Some(session);
@@ -627,6 +635,16 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_connect_volume_leaves_audio_unattenuated_before_playback() {
+        let mixer = playback_mixer().unwrap();
+        // Spirc applies this configuration directly during construction, before
+        // it accepts volume commands. Exercise the actual mixer gain, since its
+        // logarithmic 50% setting attenuates audio by about 30 dB.
+        mixer.set_volume(connect_config().initial_volume);
+        assert_eq!(mixer.get_soft_volume().attenuation_factor(), 1.0);
+    }
 
     #[test]
     fn allocator_relief_requires_a_confirmed_playing_to_paused_transition() {

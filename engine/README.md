@@ -43,7 +43,7 @@ Replies are `{"id":1,"result":{...}}` or `{"id":1,"error":"..."}`. Unknown or un
 
 `authenticate` reuses cached login when possible, otherwise opens Spotify's browser login using PKCE and a state-checked loopback callback (three-minute timeout). Result: `{connected,username,device_id}`. It does not automatically take over playback from another device; `play` activates the local Tops device.
 
-`status` and `playback` events contain `{connected,is_playing,position_ms,track_uri?,duration_ms?,title?,artist?,image_url?,volume_percent?}`. Position events arrive once per second during playback. Other events are `authentication` with `{state:"waiting_for_browser"}`, `connection` with `{connected:false}`, and `error` with `{message}`. Initial volume is 50 percent.
+`status` and `playback` events contain `{connected,is_playing,position_ms,track_uri?,duration_ms?,title?,artist?,image_url?,volume_percent?}`. Position events arrive once per second during playback. Other events are `authentication` with `{state:"waiting_for_browser"}`, `connection` with `{connected:false}`, and `error` with `{message}`. Internal volume starts at 100 percent (unity gain), leaving the app's slider to control macOS output volume. This must be set in `ConnectConfig`: librespot ignores queued `volume` commands until the device is active. The protocol's `volume` command remains available for active playback, including the live check's low-volume test.
 
 `partnerAuthContext` returns `{access_token,client_token,client_id,device_id,expires_at,token_kind:"desktop_oauth"}` for Pathfinder. Its bearer is the **original desktop OAuth grant**, refreshed when needed and paired with the session's existing client token. This is a first-party desktop grant, not a dashboard Web API grant.
 

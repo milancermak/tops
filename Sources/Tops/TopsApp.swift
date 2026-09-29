@@ -41,6 +41,7 @@ struct TopsApp: App {
                     }
                 }
                 .onAppear {
+                    model.startMediaControls()
                     TopsAppDelegate.shutdownHandler = { model.shutdown() }
                 }
         }
