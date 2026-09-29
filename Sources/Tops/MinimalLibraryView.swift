@@ -187,6 +187,7 @@ struct MinimalLibraryView: View {
 
     private func collectionRow(_ item: MusicItem) -> some View {
         MinimalSidebarCollectionRow(item: item, isSelected: selectedCollection?.id == item.id,
+                                    isCurrentPlayback: model.isCurrentPlaybackContext(collection: item),
                                     enabled: model.connected) {
             if item.kind == "track" {
                 Task { await model.play(item) }
@@ -332,6 +333,7 @@ struct MinimalLibraryView: View {
 private struct MinimalSidebarCollectionRow: View {
     let item: MusicItem
     let isSelected: Bool
+    let isCurrentPlayback: Bool
     let enabled: Bool
     let activate: () -> Void
     let playCollection: () -> Void
@@ -345,8 +347,13 @@ private struct MinimalSidebarCollectionRow: View {
 
     private var palette: MinimalLibraryPalette { .init(colorScheme: colorScheme) }
     private var hasFocus: Bool { focusedAction != nil || accessibilityFocusedAction != nil }
-    private var highlighted: Bool { isSelected || (enabled && (hovered || hasFocus)) }
+    private var persistentlyHighlighted: Bool { isSelected || isCurrentPlayback }
+    private var highlighted: Bool { persistentlyHighlighted || (enabled && (hovered || hasFocus)) }
     private var showPlay: Bool { hovered || hasFocus }
+    private var accessibilityState: String {
+        if isCurrentPlayback { return isSelected ? "Selected, current playback collection" : "Current playback collection" }
+        return isSelected ? "Selected collection" : ""
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -373,7 +380,7 @@ private struct MinimalSidebarCollectionRow: View {
             .focused($focusedAction, equals: .open)
             .accessibilityFocused($accessibilityFocusedAction, equals: .open)
             .accessibilityLabel("\(item.kind == "track" ? "Play" : "Open") \(item.title), \(item.subtitle)")
-            .accessibilityValue(isSelected ? "Selected collection" : "")
+            .accessibilityValue(accessibilityState)
 
             if item.kind != "track" {
                 // Keep this lane in the layout and accessibility tree when its
@@ -406,7 +413,7 @@ private struct MinimalSidebarCollectionRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .foregroundStyle(highlighted ? palette.highlightInk : palette.ink,
                          highlighted ? palette.highlightSecondary : palette.secondary)
-        .background(isSelected ? palette.selection : highlighted ? palette.hover : .clear)
+        .background(persistentlyHighlighted ? palette.selection : highlighted ? palette.hover : .clear)
         .contentShape(Rectangle())
         .disabled(!enabled)
         .onHover { hovered = $0 }
