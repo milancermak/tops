@@ -2,7 +2,11 @@
 
 A macOS native playback helper using upstream librespot and Rodio/CoreAudio. It runs only while the app owns its process. No Spotify desktop process, web renderer, or developer-dashboard registration is involved.
 
-The dependency is pinned to upstream commit `939dc5ee9d833e1980f9495241219d9d4868a061`. `Cargo.lock` also fixes the transitive dependency versions. This is a prototype: live authentication, audio and sleep/wake recovery need account testing.
+The dependency is pinned to upstream commit `939dc5ee9d833e1980f9495241219d9d4868a061`.
+Its core crate has a [small local OAuth provider patch](vendor/README.md), with
+source and license included so fresh checkouts build without external patches.
+`Cargo.lock` also fixes the transitive dependency versions. This is a prototype:
+live authentication, audio and sleep/wake recovery need account testing.
 
 ## Build
 
@@ -41,7 +45,13 @@ Requests:
 
 Replies are `{"id":1,"result":{...}}` or `{"id":1,"error":"..."}`. Unknown or unauthenticated commands return an error. Malformed JSON uses `id:null`.
 
-`authenticate` reuses cached login when possible, otherwise opens Spotify's browser login using PKCE and a state-checked loopback callback (three-minute timeout). Result: `{connected,username,device_id}`. It does not automatically take over playback from another device; `play` activates the local Tops device.
+`authenticate` reuses the saved OAuth grant when possible, otherwise opens
+Spotify's browser login using PKCE and a state-checked loopback callback
+(three-minute timeout). The current grant also establishes the access-point
+session, keeping playback and browsing on the same account even if older cached
+playback credentials exist. Result: `{connected,username,device_id}`. It does not
+automatically take over playback from another device; `play` activates the local
+Tops device.
 
 `status` and `playback` events contain `{connected,is_playing,position_ms,track_uri?,duration_ms?,title?,artist?,image_url?,volume_percent?}`. Position events arrive once per second during playback. Other events are `authentication` with `{state:"waiting_for_browser"}`, `connection` with `{connected:false}`, and `error` with `{message}`. Internal volume starts at 100 percent (unity gain), leaving the app's slider to control macOS output volume. This must be set in `ConnectConfig`: librespot ignores queued `volume` commands until the device is active. The protocol's `volume` command remains available for active playback, including the live check's low-volume test.
 
@@ -49,11 +59,43 @@ Replies are `{"id":1,"result":{...}}` or `{"id":1,"error":"..."}`. Unknown or un
 
 Optional parameters `{ "force_refresh": true }` force one OAuth refresh even if the cached bearer has not expired. This never opens a browser. The caller may use it for one retry after HTTP 401; it must not loop or refresh in response to HTTP 403. A revoked refresh grant reports an error requiring a new sign-in.
 
-`authContext` remains separate and returns the same fields with `token_kind:"login5"`. Its bearer comes from the session's **Login5 token**; it remains available for distinguishing native streaming/session authorization during diagnostics. The app should use `partnerAuthContext` for Pathfinder requests.
+`authContext` remains available for native playback authorization and returns
+the same fields with `token_kind:"desktop_oauth"`. The playback token provider
+uses the original desktop OAuth grant directly, rather than exchanging the
+access-point credential with Login5. The app uses `partnerAuthContext` for
+Pathfinder requests.
 
-**Both responses contain credentials, not diagnostic output.** Keep them inside the app-owned pipe, never print or persist them in logs. `expires_at` is Unix seconds. The engine owns desktop OAuth refresh, caches replacement refresh tokens atomically, and serializes refreshes through its request loop. Call `partnerAuthContext` again when partner authorization needs renewing. Neither method provides a public Web API token.
+**Both responses contain credentials, not diagnostic output.** Keep them inside
+the app-owned pipe, never print or persist them in logs. `expires_at` is Unix
+seconds. The engine owns desktop OAuth refresh and caches replacement refresh
+tokens atomically. A shared asynchronous mutex serializes browsing and playback
+refreshes, so only one request rotates the grant at a time. Background playback
+refresh never opens a browser and propagates authorization failures rather than
+silently changing token sources. Call `partnerAuthContext` again when partner
+authorization needs renewing. Neither method provides a public Web API token.
 
-No upstream logger is installed because upstream trace logs can include credentials. The parent must likewise avoid logging raw protocol replies.
+Connection diagnostics use a narrowly filtered logger: only known service names
+from librespot's HTTP request-start messages are retained, while every other
+upstream log is discarded. Tokens, usernames, device IDs, headers, response
+bodies and raw URLs are never included. The parent must likewise avoid logging
+raw protocol replies.
+
+Each playback connection attempt emits a `connection_diagnostic` event and
+atomically replaces `connection-diagnostic.json` in the engine's private data
+directory (mode 0600). For the app this is
+`~/Library/Application Support/Tops/session/connection-diagnostic.json`.
+The report contains a start timestamp, elapsed milliseconds, stage, outcome,
+numeric HTTP status when available, a safe error category, and up to 16 recent
+request service names with timings. It covers playback setup after OAuth has
+succeeded; an earlier browser sign-in or OAuth failure does not replace it.
+
+Client-token acquisition is identified separately and its cached result is reused
+by librespot's normal connection setup. Failures in later session setup list
+recently requested services as clues, not proof that the last request failed.
+Both stages share the existing 35-second connection timeout. No new retries are
+added. The error banner includes the stage and HTTP status; temporary sessions
+are shut down on failure or timeout. Only the latest report is retained locally,
+and nothing is uploaded.
 
 After a confirmed transition from playing to paused, the engine asks the macOS allocator to release unused pages through `malloc_zone_pressure_relief(NULL, 0)`. This runs on a blocking control worker after releasing the playback-state lock, with a fresh state check to skip cleanup if playback already resumed. It does not run at authentication, on repeated paused/seek events, on a timer, or in the audio callback. Live allocations, decoder state, bitrate and gapless playback are unchanged.
 
@@ -63,6 +105,20 @@ After a confirmed transition from playing to paused, the engine asks the macOS a
 
 ```sh
 python3 tests/protocol_smoke.py target/release/tops-engine
+cargo test --release --locked -p tops-engine
+cargo test --release --locked -p librespot-core --lib external_token_provider_tests
 ```
 
-This checks JSON framing, both authorization methods' error responses before login, private cache permissions, stable device identity and clean shutdown. `cargo test --release --locked` additionally checks OAuth callback state validation, that token-service errors do not echo credentials, and that the partner method routes to the original desktop grant rather than Login5. These tests do not open a browser or contact Spotify.
+This checks JSON framing, both authorization methods' error responses before
+login, private cache permissions, stable device identity and clean shutdown.
+`cargo test --release --locked` additionally checks OAuth callback validation,
+credential-free diagnostics and shared OAuth refresh behavior. These tests do
+not open a browser or contact Spotify.
+
+The September 29 OAuth playback repair passed 14 engine tests and four provider
+tests. Live verification covered connection, forced OAuth renewal shared by
+playback and browsing, search, track metadata and advancing playback, pause,
+seek, resume, and graceful shutdown. Authenticated stdin EOF also exited cleanly.
+The complete app was rebuilt and signed. Expiry-driven refresh is covered by
+mocked concurrent requests; the live test exercises an explicit refresh rather
+than waiting for a token's natural expiry.

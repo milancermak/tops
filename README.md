@@ -117,9 +117,11 @@ The current full hub is `spotify:page:0JQ5DAt0tbjZptfcdMSKl3`, fetched via Spoti
 private Pathfinder `browsePage` operation. Individual shelves use `browseSection`;
 `homeSection` provides an actual personalized shelf fallback when the hub returns
 no readable music. A desktop OAuth bearer, Spotify client token, desktop request
-headers and an explicit User-Agent authenticate Pathfinder requests. Login5
-remains separate for playback services. Tokens only pass between the app and its
-private child process.
+headers and an explicit User-Agent authenticate Pathfinder requests. Native
+playback uses the same desktop OAuth grant through a small, documented
+[librespot-core provider patch](engine/vendor/README.md), avoiding a redundant
+Login5 exchange. One shared store serializes token refresh for browsing and
+playback. Tokens only pass between the app and its private child process.
 
 Public operation hashes are recorded in `config/operations.json` with exact CDN
 source URLs, capture time and SHA-256 checksums. Refresh them without signing in:
@@ -318,6 +320,8 @@ Tops source code is available under the [MIT License](LICENSE).
   is not bundled. Exact source attribution is in docs/PROTOCOL.md.
 - librespot: https://github.com/librespot-org/librespot (MIT), pinned revision
   `939dc5ee9d833e1980f9495241219d9d4868a061`; its play_connect example informed the engine.
+  The core crate is vendored with the [OAuth provider patch](engine/vendor/README.md)
+  and its original license; all other librespot crates remain pinned upstream.
 - Psst: https://github.com/jpochyla/psst (MIT), independently demonstrates internal
   personalized shelves and Login5 authentication.
 - Spotifly: https://github.com/ralph/Spotifly (MIT), a reference for desktop PKCE and

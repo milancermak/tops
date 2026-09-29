@@ -133,7 +133,10 @@ class Engine:
                     self.process.kill()
                     await asyncio.wait_for(self.process.wait(), 2)
         report("cleanup", pause_confirmed=pause_confirmed,
-               owned_engine_stopped=self.process.returncode is not None)
+               owned_engine_stopped=self.process.returncode is not None,
+               graceful_exit=self.process.returncode == 0)
+        if self.process.returncode != 0:
+            raise CheckFailed("Playback engine did not shut down cleanly")
 
 
 def search_request(auth, operation_hash):
@@ -204,6 +207,18 @@ def first_playable_track(root):
 async def validate(engine, operation_hash):
     await engine.call("authenticate", timeout=45)
     report("authenticated")
+    # Exercise real renewal through the one shared owner before native metadata
+    # and audio requests. Compare in memory; never print either bearer.
+    partner = await engine.call("partnerAuthContext", {"force_refresh": True}, timeout=35)
+    playback = await engine.call("authContext", timeout=20)
+    if (partner.get("token_kind") != "desktop_oauth"
+            or playback.get("token_kind") != "desktop_oauth"
+            or not partner.get("access_token")
+            or partner.get("access_token") != playback.get("access_token")
+            or partner.get("expires_at") != playback.get("expires_at")):
+        raise CheckFailed("Playback and browsing did not share the refreshed grant")
+    del partner, playback
+    report("shared_oauth_refresh_verified")
     for attempt in range(2):
         auth = await engine.call("partnerAuthContext", {"force_refresh": attempt == 1}, timeout=25)
         status, response = await asyncio.to_thread(fetch_search, search_request(auth, operation_hash))

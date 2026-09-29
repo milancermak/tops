@@ -1,5 +1,9 @@
+mod diagnostics;
+mod oauth;
+
+use oauth::{CLIENT_ID, OAuthStore, PlaybackTokenProvider, SharedOAuth};
+
 use anyhow::{Context, Result, bail};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use librespot::{
     connect::{ConnectConfig, LoadRequest, LoadRequestOptions, Spirc},
     core::{
@@ -17,10 +21,8 @@ use librespot::{
         player::{Player, PlayerEvent},
     },
 };
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Write,
@@ -30,14 +32,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpListener,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::mpsc,
     task::JoinHandle,
 };
-
-const CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
-const SCOPES: &str = "streaming user-personalized user-read-private user-read-email user-library-read playlist-read playlist-read-private playlist-read-collaborative user-read-play-history user-read-recently-played user-top-read user-read-playback-state user-read-currently-playing user-modify-playback-state app-remote-control";
 
 #[derive(Deserialize)]
 struct Request {
@@ -66,24 +64,17 @@ struct Playback {
     volume_percent: Option<f64>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Tokens {
-    access_token: String,
-    refresh_token: String,
-    expires_at: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthTokenSource {
     DesktopOAuth,
-    Login5,
+    Playback,
 }
 
 impl AuthTokenSource {
     fn for_method(method: &str) -> Option<Self> {
         match method {
             "partnerAuthContext" => Some(Self::DesktopOAuth),
-            "authContext" => Some(Self::Login5),
+            "authContext" => Some(Self::Playback),
             _ => None,
         }
     }
@@ -91,7 +82,7 @@ impl AuthTokenSource {
     fn label(self) -> &'static str {
         match self {
             Self::DesktopOAuth => "desktop_oauth",
-            Self::Login5 => "login5",
+            Self::Playback => "desktop_oauth",
         }
     }
 }
@@ -99,8 +90,7 @@ impl AuthTokenSource {
 struct Engine {
     data_dir: PathBuf,
     device_id: String,
-    http: reqwest::Client,
-    tokens: Option<Tokens>,
+    oauth: SharedOAuth,
     session: Option<Session>,
     spirc: Option<Spirc>,
     tasks: Vec<JoinHandle<()>>,
@@ -113,10 +103,6 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn token_needs_refresh(expires_at: u64, current_time: u64, force_refresh: bool) -> bool {
-    force_refresh || expires_at <= current_time.saturating_add(120)
 }
 
 fn connect_config() -> ConnectConfig {
@@ -183,41 +169,6 @@ fn private_write(path: &Path, contents: &[u8]) -> Result<()> {
     }
     result
 }
-fn random_string() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn token_failure(status: u16, body: &Value) -> (bool, String) {
-    if body.get("error").and_then(Value::as_str) == Some("invalid_grant") {
-        (
-            true,
-            "Spotify authorization expired. Sign in again.".to_owned(),
-        )
-    } else {
-        (
-            false,
-            format!("Spotify token request failed (HTTP {status})"),
-        )
-    }
-}
-
-fn callback_code(target: &str, expected_state: &str) -> Result<Option<String>> {
-    let Ok(callback) = url::Url::parse(&format!("http://127.0.0.1{target}")) else {
-        return Ok(None);
-    };
-    let params: std::collections::HashMap<_, _> = callback.query_pairs().into_owned().collect();
-    if callback.path() != "/login"
-        || params.get("state").map(String::as_str) != Some(expected_state)
-    {
-        return Ok(None);
-    }
-    if params.contains_key("error") {
-        bail!("Spotify sign-in was declined");
-    }
-    Ok(params.get("code").filter(|code| !code.is_empty()).cloned())
-}
 
 impl Engine {
     fn new(data_dir: PathBuf, output: mpsc::UnboundedSender<Value>) -> Result<Self> {
@@ -226,166 +177,20 @@ impl Engine {
         let device_id =
             fs::read_to_string(&device_path).unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         private_write(&device_path, device_id.as_bytes())?;
-        let tokens = fs::read(data_dir.join("oauth.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let oauth = Arc::new(tokio::sync::Mutex::new(OAuthStore::new(
+            data_dir.clone(),
+            output.clone(),
+        )?));
         Ok(Self {
             data_dir,
             device_id,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()?,
-            tokens,
+            oauth,
             session: None,
             spirc: None,
             tasks: vec![],
             state: Arc::new(Mutex::new(Playback::default())),
             output,
         })
-    }
-
-    async fn exchange(
-        &mut self,
-        fields: &[(&str, &str)],
-        fallback_refresh: Option<String>,
-    ) -> Result<()> {
-        let response = self
-            .http
-            .post("https://accounts.spotify.com/api/token")
-            .form(fields)
-            .send()
-            .await
-            .context("Spotify token service unavailable")?;
-        let status = response.status();
-        let body: Value = response
-            .json()
-            .await
-            .context("Invalid Spotify token response")?;
-        if !status.is_success() {
-            // Never include response bodies: they can contain credentials or reflected input.
-            let (revoked, message) = token_failure(status.as_u16(), &body);
-            if revoked {
-                self.tokens = None;
-                let _ = fs::remove_file(self.data_dir.join("oauth.json"));
-            }
-            bail!(message);
-        }
-        let access_token = body["access_token"]
-            .as_str()
-            .context("Missing access token")?
-            .to_owned();
-        let refresh_token = body["refresh_token"]
-            .as_str()
-            .map(str::to_owned)
-            .or(fallback_refresh)
-            .context("Missing refresh token")?;
-        let tokens = Tokens {
-            access_token,
-            refresh_token,
-            expires_at: now() + body["expires_in"].as_u64().unwrap_or(3600),
-        };
-        private_write(
-            &self.data_dir.join("oauth.json"),
-            &serde_json::to_vec(&tokens)?,
-        )?;
-        self.tokens = Some(tokens);
-        Ok(())
-    }
-
-    async fn valid_token(&mut self, interactive: bool, force_refresh: bool) -> Result<String> {
-        if let Some(tokens) = &self.tokens {
-            if !token_needs_refresh(tokens.expires_at, now(), force_refresh) {
-                return Ok(tokens.access_token.clone());
-            }
-            let refresh = tokens.refresh_token.clone();
-            let refreshed = self
-                .exchange(
-                    &[
-                        ("grant_type", "refresh_token"),
-                        ("refresh_token", &refresh),
-                        ("client_id", CLIENT_ID),
-                    ],
-                    Some(refresh.clone()),
-                )
-                .await;
-            if let Err(error) = refreshed {
-                if interactive && self.tokens.is_none() {
-                    self.authorize().await?;
-                } else {
-                    return Err(error);
-                }
-            }
-        } else if interactive {
-            self.authorize().await?;
-        } else {
-            bail!("Sign in with Spotify first");
-        }
-        Ok(self
-            .tokens
-            .as_ref()
-            .context("Authorization not available")?
-            .access_token
-            .clone())
-    }
-
-    async fn authorize(&mut self) -> Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .context("Cannot start local login callback")?;
-        let redirect = format!("http://127.0.0.1:{}/login", listener.local_addr()?.port());
-        let verifier = random_string();
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        let state = random_string();
-        let mut auth_url = url::Url::parse("https://accounts.spotify.com/authorize")?;
-        auth_url.query_pairs_mut().extend_pairs([
-            ("client_id", CLIENT_ID),
-            ("response_type", "code"),
-            ("redirect_uri", redirect.as_str()),
-            ("scope", SCOPES),
-            ("state", state.as_str()),
-            ("code_challenge_method", "S256"),
-            ("code_challenge", challenge.as_str()),
-        ]);
-        self.output
-            .send(json!({"event":"authentication","data":{"state":"waiting_for_browser"}}))?;
-        let opened = tokio::process::Command::new("/usr/bin/open")
-            .arg(auth_url.as_str())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await?;
-        if !opened.success() {
-            bail!("Could not open Spotify sign-in in your browser");
-        }
-        let code = tokio::time::timeout(Duration::from_secs(180), async {
-            loop {
-                let (mut socket, _) = listener.accept().await?;
-                let mut bytes = vec![0u8; 8192];
-                let count = match tokio::time::timeout(Duration::from_secs(3), socket.read(&mut bytes)).await {
-                    Ok(Ok(n)) => n,
-                    _ => continue,
-                };
-                let request = String::from_utf8_lossy(&bytes[..count]);
-                let target = request.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("");
-                let code_result = callback_code(target, &state);
-                let code = code_result.as_ref().ok().and_then(|code| code.as_ref());
-                let message = if code.is_some() { "Spotify is connected. You can close this tab and return to Tops." } else { "This callback did not complete authorization. Return to the Spotify sign-in page." };
-                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", message.len(), message);
-                let _ = socket.write_all(response.as_bytes()).await;
-                if let Some(code) = code_result? { return Ok::<_, anyhow::Error>(code); }
-            }
-        }).await.context("Spotify sign-in timed out")??;
-        self.exchange(
-            &[
-                ("grant_type", "authorization_code"),
-                ("code", &code),
-                ("redirect_uri", &redirect),
-                ("client_id", CLIENT_ID),
-                ("code_verifier", &verifier),
-            ],
-            None,
-        )
-        .await
     }
 
     async fn authenticate(&mut self) -> Result<Value> {
@@ -398,18 +203,22 @@ impl Engine {
             );
         }
         self.disconnect();
-        let access_token = self.valid_token(true, false).await?;
+        // Release the grant lock before Spirc calls the same store through its provider.
+        let grant = { self.oauth.lock().await.valid_token(true, false).await? };
         let cache_dir = self.data_dir.join("session");
         private_dir(&cache_dir)?;
         let cache = Cache::new(Some(&cache_dir), Some(&cache_dir), None, None)?;
-        let credentials = cache
-            .credentials()
-            .unwrap_or_else(|| Credentials::with_access_token(access_token));
+        // AP and HTTP authorization must refer to the same account, even after
+        // the browser grant changes. Never prefer a possibly different cached user.
+        let credentials = Credentials::with_access_token(grant.access_token);
         let config = SessionConfig {
             device_id: self.device_id.clone(),
             ..Default::default()
         };
         let session = Session::new(config, Some(cache));
+        session
+            .login5()
+            .set_token_provider(Arc::new(PlaybackTokenProvider(self.oauth.clone())));
         let mixer = playback_mixer()?;
         let sink =
             audio_backend::find(Some("rodio".to_owned())).context("CoreAudio output missing")?;
@@ -427,12 +236,37 @@ impl Engine {
         let mut events = player.get_player_event_channel();
         let connect_config = connect_config();
         let initial_volume_percent = connect_config.initial_volume as f64 / u16::MAX as f64 * 100.0;
-        let (spirc, spirc_task) = tokio::time::timeout(
-            Duration::from_secs(35),
-            Spirc::new(connect_config, session.clone(), credentials, player, mixer),
-        )
-        .await
-        .context("Spotify connection timed out")??;
+        let mut attempt = diagnostics::Attempt::begin(now());
+        let connection = tokio::time::timeout(Duration::from_secs(35), async {
+            // Spirc normally does this first. Acquire it here to identify this
+            // failure exactly; Spirc reuses the same session's cached token.
+            session.spclient().client_token().await?;
+            attempt.stage = diagnostics::Stage::PlaybackSession;
+            Spirc::new(connect_config, session.clone(), credentials, player, mixer).await
+        })
+        .await;
+        let report = match &connection {
+            Ok(Ok(_)) => attempt.report(None, false),
+            Ok(Err(error)) => attempt.report(Some(error), false),
+            Err(_) => attempt.report(None, true),
+        };
+        drop(attempt);
+        // A bounded, private latest-attempt report; never write raw errors or
+        // protocol replies. Failure to save diagnostics must not prevent login.
+        if let Ok(bytes) = serde_json::to_vec_pretty(&report) {
+            let _ = private_write(&self.data_dir.join("connection-diagnostic.json"), &bytes);
+        }
+        let _ = self
+            .output
+            .send(json!({"event":"connection_diagnostic","data":report}));
+        let (spirc, spirc_task) = match connection {
+            Ok(Ok(connected)) => connected,
+            _ => {
+                // Spirc may have opened a session before a later service failed.
+                session.shutdown();
+                bail!(report.failure_message());
+            }
+        };
         let state = self.state.clone();
         let output = self.output.clone();
         self.tasks.push(tokio::spawn(async move {
@@ -511,17 +345,20 @@ impl Engine {
     ) -> Result<(String, u64)> {
         Ok(match source {
             AuthTokenSource::DesktopOAuth => {
-                // Pathfinder uses the original first-party desktop grant. Keep its refresh
-                // ownership here; the single request loop serializes all refreshes.
-                let access_token = self.valid_token(false, force_refresh).await?;
-                let expires_at = self
-                    .tokens
-                    .as_ref()
-                    .context("Authorization not available")?
-                    .expires_at;
-                (access_token, expires_at)
+                let grant = self
+                    .oauth
+                    .lock()
+                    .await
+                    .valid_token(false, force_refresh)
+                    .await?;
+                (grant.access_token, grant.expires_at)
             }
-            AuthTokenSource::Login5 => {
+            AuthTokenSource::Playback => {
+                // Refresh under the shared lock, then release it before the provider
+                // re-enters the store through auth_token().
+                if force_refresh {
+                    self.oauth.lock().await.valid_token(false, true).await?;
+                }
                 let session = self
                     .session
                     .as_ref()
@@ -683,7 +520,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partner_auth_routes_to_original_desktop_grant_separately_from_login5() {
+    async fn browsing_and_playback_share_the_desktop_grant_without_reentrant_locking() {
         let request: Request =
             serde_json::from_value(json!({"id":12,"method":"partnerAuthContext","params":{}}))
                 .unwrap();
@@ -693,22 +530,20 @@ mod tests {
         assert_ne!(source, AuthTokenSource::for_method("authContext").unwrap());
         assert_eq!(
             AuthTokenSource::for_method("authContext"),
-            Some(AuthTokenSource::Login5)
+            Some(AuthTokenSource::Playback)
         );
         assert_eq!(AuthTokenSource::for_method("status"), None);
         let (output, _receiver) = mpsc::unbounded_channel();
         let expiry = now() + 3600;
-        // Entirely in-memory fixture: a partner grant must work without a Login5 session.
-        // Selecting Login5 here would fail before any network call can occur.
+        // Entirely in-memory fixture: browsing works without a playback session;
+        // playback goes through the injected provider without calling Spotify.
         let mut engine = Engine {
             data_dir: PathBuf::from("/unused-test-path"),
             device_id: "fixture-device".to_owned(),
-            http: reqwest::Client::new(),
-            tokens: Some(Tokens {
-                access_token: "fixture-original-desktop-oauth".to_owned(),
-                refresh_token: "fixture-refresh".to_owned(),
-                expires_at: expiry,
-            }),
+            oauth: Arc::new(tokio::sync::Mutex::new(OAuthStore::fixture(
+                output.clone(),
+                expiry,
+            ))),
             session: None,
             spirc: None,
             tasks: vec![],
@@ -721,56 +556,26 @@ mod tests {
         );
         assert!(
             engine
-                .authorization_token(AuthTokenSource::Login5, false)
+                .authorization_token(AuthTokenSource::Playback, false)
                 .await
                 .is_err()
         );
-    }
-
-    #[test]
-    fn forced_refresh_replaces_even_an_unexpired_rejected_grant() {
-        assert!(!token_needs_refresh(5000, 1000, false));
-        assert!(token_needs_refresh(5000, 1000, true));
-        assert!(token_needs_refresh(1120, 1000, false));
-        assert!(!token_needs_refresh(1121, 1000, false));
-        assert!(token_needs_refresh(999, 1000, false));
-    }
-
-    #[test]
-    fn callback_requires_matching_state_and_path_before_code_or_denial() {
-        assert_eq!(
-            callback_code("/login?code=valid&state=expected", "expected").unwrap(),
-            Some("valid".to_owned())
-        );
-        for path in [
-            "/login?code=attacker",
-            "/login?code=attacker&state=wrong",
-            "/other?code=attacker&state=expected",
-            "/login?error=denied&state=wrong",
-        ] {
-            assert_eq!(callback_code(path, "expected").unwrap(), None);
-        }
-        assert!(callback_code("/login?error=access_denied&state=expected", "expected").is_err());
-    }
-
-    #[test]
-    fn token_failures_never_echo_response_credentials_and_only_invalid_grant_revokes() {
-        let secret = "fixture-access-or-refresh-token";
-        for status in [400, 401, 429, 500] {
-            let (revoked, message) = token_failure(
-                status,
-                &json!({"error":"server_error","access_token":secret,"error_description":secret}),
-            );
-            assert!(!revoked);
-            assert!(!message.contains(secret));
-            assert!(message.contains(&status.to_string()));
-        }
-        let (revoked, message) = token_failure(
-            400,
-            &json!({"error":"invalid_grant","error_description":secret}),
-        );
-        assert!(revoked);
-        assert!(!message.contains(secret));
+        let session = Session::new(SessionConfig::default(), None);
+        session
+            .login5()
+            .set_token_provider(Arc::new(PlaybackTokenProvider(engine.oauth.clone())));
+        engine.session = Some(session);
+        let (token, token_expiry) = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.authorization_token(AuthTokenSource::Playback, false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(token, "fixture-original-desktop-oauth");
+        assert_eq!(token_expiry, expiry);
+        assert_eq!(AuthTokenSource::Playback.label(), "desktop_oauth");
+        engine.disconnect();
     }
 }
 
@@ -784,7 +589,9 @@ async fn main() -> Result<()> {
     if !path.is_absolute() {
         bail!("--data-dir must be absolute");
     }
-    // No logger is installed. Upstream trace logs may include authentication material.
+    // Only allowlisted service names are retained; no upstream log is forwarded.
+    diagnostics::install()
+        .map_err(|_| anyhow::anyhow!("Cannot initialize connection diagnostics"))?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
