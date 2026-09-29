@@ -177,6 +177,7 @@ struct MinimalLibraryView: View {
     private func sectionTitle(_ title: String) -> some View {
         Text(title)
             .font(.system(size: 18, weight: .medium))
+            .foregroundStyle(Color(red: 29.0 / 255, green: 185.0 / 255, blue: 84.0 / 255))
             .tracking(-0.35)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 14)
