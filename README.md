@@ -13,10 +13,14 @@ account on an Apple Silicon Mac running macOS 15.7.4. The feed displayed nine
 shelves, including Daily Mix 1–6, Release Radar and Discover Weekly. Search,
 track and playlist playback, pause/resume, seek, next and previous were exercised.
 
-The interface uses one native titlebar with Back and Home on the left, search on
-the right, and a settings cog at the far right. The center stays empty. Cover grids align
-at the top and reserve consistent title/subtitle space. Playlist and album cards
-open track lists; artist cards open top tracks. Opening a card does not start
+The default **Text** interface opens as a narrow, scrollable column of sections,
+collection names and descriptions. Selecting a collection expands the window to
+the right with its songs. Rows use compact spacing and muted Spotify-green
+highlights; the green button beside the collection title starts its queue or
+pauses/resumes its playback. The native titlebar shows **Tops - Song by Artist**.
+**View → Interface → Artwork** switches to the cover-based interface immediately;
+**Text** switches back. The choice is remembered, and switching preserves the
+connection, playback and open collection. Opening a collection does not start
 playback. Space toggles playback when the window has focus, while spaces typed
 into search remain ordinary text.
 
@@ -41,8 +45,8 @@ open dist/Tops.app
 The app has two sections:
 
 - **Made for You:** reads Spotify's actual internal personalized browse hub;
-  **Show more** pages through additional items in a shelf. The Home button returns
-  here from search or collection details. Discover New Music and Your Daily Mixes
+  **Show more** pages through additional items in a shelf. Close search returns
+  here in Text mode; the Home button does so in Artwork mode. Discover New Music and Your Daily Mixes
   lead the page; Watch What You Love is hidden. Tops prefetches the first 50 tracks
   of each distinct collection in the first six displayed sections, then warms
   another section ahead as you scroll. Visible search collection sections are
@@ -50,11 +54,11 @@ The app has two sections:
   collection takes priority over queued background work.
 - **Search:** searches songs, albums, artists and playlists, with the first 20
   results per category. Search starts 400ms after the last edit; Return submits
-  immediately. The first seven songs appear with larger covers and a centered
+  immediately. Cmd-F reveals the compact search field in Text mode. The first seven songs appear with a centered
   **Expand** control, followed by Artists, Playlists, and Albums. Click a song to play it;
   click a playlist, album or artist to inspect its songs first.
 
-Collection covers animate from the clicked card to the top-left detail header in
+In Artwork mode, collection covers animate from the clicked card to the top-left detail header in
 240ms, with an immediate image handoff that avoids a second fade;
 Reduce Motion skips the movement. Collection details show track names, artists and durations;
 additional playlist/album pages load near the end of the current rows, with
@@ -96,7 +100,7 @@ Accessibility or Input Monitoring permission is needed.
 Search pagination, automatic reconnect, offline playback, shuffle
 and repeat are not implemented.
 
-The bottom player arranges track information, transport buttons, progress and
+In Artwork mode, the bottom player arranges track information, transport buttons, progress and
 volume in a single row, with both sliders on the same horizontal line. Its 42pt
 cover matches the playlist song covers; all artwork starts at the same 28pt inset.
 

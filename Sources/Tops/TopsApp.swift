@@ -31,10 +31,11 @@ final class TopsAppDelegate: NSObject, NSApplicationDelegate {
 struct TopsApp: App {
     @NSApplicationDelegateAdaptor(TopsAppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
+    @AppStorage("interfaceStyle") private var interface = AppInterface.text
 
     var body: some Scene {
-        Window("Tops", id: "main") {
-            ContentView(model: model)
+        Window(model.windowTitle, id: "main") {
+            ContentView(model: model, interface: interface)
                 .background {
                     PlaybackKeyboardShortcut(enabled: model.connected && model.nowPlaying != nil) {
                         Task { await model.togglePlayback() }
@@ -45,10 +46,16 @@ struct TopsApp: App {
                     TopsAppDelegate.shutdownHandler = { model.shutdown() }
                 }
         }
-        .defaultSize(width: 1_080, height: 760)
+        .defaultSize(width: 320, height: 640)
         .windowToolbarStyle(.unified)
-        .windowStyle(.hiddenTitleBar)
+        .windowStyle(.titleBar)
         .commands {
+            CommandGroup(after: .toolbar) {
+                Picker("Interface", selection: $interface) {
+                    Text("Text").tag(AppInterface.text)
+                    Text("Artwork").tag(AppInterface.artwork)
+                }
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Search") {
                     NotificationCenter.default.post(name: .topsFocusSearch, object: nil)
@@ -60,6 +67,11 @@ struct TopsApp: App {
                     Task { await model.refresh() }
                 }
                 .keyboardShortcut("r", modifiers: .command)
+                .disabled(!model.connected || model.busy)
+
+                Button("Reconnect Spotify") {
+                    Task { await model.connect() }
+                }
                 .disabled(!model.connected || model.busy)
             }
         }

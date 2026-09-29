@@ -43,6 +43,7 @@ final class AppModel: ObservableObject {
     @Published var collectionLoading = false
     @Published var collectionError: String?
     @Published var nowPlaying: MusicItem?
+    @Published private(set) var playbackCollectionID: String?
     @Published var status = "Connect to start listening"
 
     // Progress ticks only invalidate views observing playback, not the library.
@@ -69,6 +70,8 @@ final class AppModel: ObservableObject {
     private var collectionFailedOffset: Int?
     private var collectionSnapshot = 0
     private var collectionItem: MusicItem?
+    private var playbackRequestRevision = 0
+    private var playbackTrackRevision = 0
     private lazy var collectionStore: CollectionStore = {
         if let suppliedCollectionStore { return suppliedCollectionStore }
         if let collectionLoader { return CollectionStore(directory: nil, loader: collectionLoader) }
@@ -196,6 +199,8 @@ final class AppModel: ObservableObject {
 
     private func clearAccountContent() {
         accountRevision += 1
+        playbackRequestRevision += 1
+        setPlaybackContext(nil)
         collectionStore.reset()
         invalidateSearch()
         query = ""
@@ -443,15 +448,47 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func play(_ item: MusicItem) async {
+    func isCurrentPlaybackContext(collection item: MusicItem) -> Bool {
+        connected && nowPlaying != nil && playbackCollectionID == item.id
+    }
+
+    func toggleCollectionPlayback(_ item: MusicItem) async {
         guard connected else { return }
+        if isCurrentPlaybackContext(collection: item) {
+            await togglePlayback()
+        } else {
+            // Loading the collection URI keeps Spotify's continuous queue.
+            // Loading its first track would create a one-song queue instead.
+            await play(item, context: item)
+        }
+    }
+
+    private func setPlaybackContext(_ id: String?) {
+        if playbackCollectionID != id { playbackCollectionID = id }
+    }
+
+    func play(_ item: MusicItem, context: MusicItem? = nil) async {
+        guard connected else { return }
+        playbackRequestRevision += 1
+        let requestRevision = playbackRequestRevision
+        let account = accountRevision
+        let trackRevision = playbackTrackRevision
+        let context = context ?? (["playlist", "album", "artist"].contains(item.kind) ? item : nil)
         do {
             _ = try await engine.call("play", ["uri": item.id])
-            if nowPlaying != item { nowPlaying = item }
-            playback.update(positionMS: 0, durationMS: 0)
+            guard connected, account == accountRevision, requestRevision == playbackRequestRevision else { return }
+            let trackChanged = trackRevision != playbackTrackRevision
+            if !trackChanged {
+                if nowPlaying != item { nowPlaying = item }
+                playback.update(positionMS: 0, durationMS: 0)
+            }
+            setPlaybackContext(context?.id)
             updateMediaControls()
             error = nil
-        } catch { self.error = error.localizedDescription }
+        } catch {
+            guard connected, account == accountRevision, requestRevision == playbackRequestRevision else { return }
+            self.error = error.localizedDescription
+        }
     }
 
     func togglePlayback() async { await command(playback.isPlaying ? "pause" : "resume") }
@@ -483,6 +520,9 @@ final class AppModel: ObservableObject {
                 durationMS: data["duration_ms"] as? Double
             )
             if let uri = data["track_uri"] as? String {
+                if nowPlaying?.id != uri { playbackTrackRevision += 1 }
+                // The helper has no context ID. A next track may be beyond the
+                // cached page, so track changes cannot reliably clear context.
                 if let title = data["title"] as? String {
                     let artist = data["artist"] as? String ?? ""
                     let image = data["image_url"] as? String

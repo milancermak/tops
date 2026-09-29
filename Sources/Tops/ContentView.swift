@@ -20,6 +20,7 @@ private enum Destination: String {
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
+    var interface: AppInterface = .text
     @State private var destination: Destination = .madeForYou
     @State private var selectedCollection: MusicItem?
     @State private var contentWidth: CGFloat = 1_080
@@ -40,6 +41,17 @@ struct ContentView: View {
                     errorBanner(error)
                 }
                 if model.connected {
+                    if interface == .text {
+                        MinimalLibraryView(model: model, selectedCollection: $selectedCollection,
+                                           openCollection: { activate($0, from: .zero, image: nil) },
+                                           closeCollection: { closeCollection() },
+                                           searchVisible: destination == .search,
+                                           searchFocusRequest: searchFocusRequest,
+                                           hideSearch: {
+                                               searchFocusRequest = .init(focused: false)
+                                               destination = .madeForYou
+                                           })
+                    } else {
                     ZStack(alignment: .topLeading) {
                         Group {
                             if destination == .search { searchContent }
@@ -71,22 +83,29 @@ struct ContentView: View {
                     }
                     .coordinateSpace(name: CollectionCoverSpace.content)
                     .clipped()
+                    }
                 } else {
-                    signIn
+                    if interface == .text { minimalSignIn }
+                    else { signIn }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .windowBackgroundColor))
 
-            if model.connected {
+            if model.connected && interface == .artwork {
                 Divider()
                 PlaybackBar(model: model)
             }
         }
-        .frame(minWidth: 800, minHeight: 550)
+        .frame(minWidth: interface == .text ? 280 : 800, minHeight: interface == .text ? 500 : 550)
         .tint(.mint)
+        .background {
+            InterfaceWindow(interface: interface, collectionOpen: selectedCollection != nil,
+                            reduceMotion: reduceMotion, title: model.windowTitle)
+        }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
         .toolbar {
+            if interface == .artwork {
             ToolbarItem(placement: .navigation) {
                 HStack(spacing: 12) {
                     navigationButtons
@@ -115,11 +134,19 @@ struct ContentView: View {
                 // Reserve the titlebar's traffic lights and outer insets.
                 .frame(width: max(0, contentWidth - 128))
             }
+            }
         }
         .task {
             if model.connected { await model.refresh() }
         }
         .onChange(of: model.query) { _, _ in songsExpanded = false }
+        .onChange(of: interface) { _, _ in
+            coverFlight = nil
+            collectionReturnID = nil
+            collectionReturning = false
+            pendingCollectionReturn = nil
+            navigationExpanded = selectedCollection != nil
+        }
         .onChange(of: model.connected) { _, connected in
             if !connected { closeCollection() }
         }
@@ -127,6 +154,13 @@ struct ContentView: View {
             guard model.connected else { return }
             showSearch()
             searchFocusRequest = .init(focused: true)
+        }
+        .onExitCommand {
+            if selectedCollection != nil { closeCollection() }
+            else if interface == .text, destination == .search {
+                searchFocusRequest = .init(focused: false)
+                destination = .madeForYou
+            }
         }
     }
 
@@ -416,7 +450,7 @@ struct ContentView: View {
                             .lineLimit(3)
                         Button {
                             guard let collection else { return }
-                            Task { await model.play(collection.item) }
+                            Task { await model.play(collection.item, context: collection.item) }
                         } label: {
                             Label("Play", systemImage: "play.fill")
                                 .font(.system(size: 12, weight: .semibold))
@@ -455,7 +489,7 @@ struct ContentView: View {
                         ForEach(collection.tracks) { track in
                             TrackRow(item: track.musicItem, isCurrent: model.nowPlaying?.id == track.uri,
                                      durationMS: track.durationMS, isPlayable: track.isPlayable) {
-                                Task { await model.play(track.musicItem) }
+                                Task { await model.play(track.musicItem, context: selected) }
                             }
                             .onAppear {
                                 Task { await model.loadMoreCollectionIfNeeded(near: track.id) }
@@ -493,6 +527,27 @@ struct ContentView: View {
             .padding(MusicLayout.contentInset)
         }
         .id(selected.id)
+    }
+
+    private var minimalSignIn: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Tops").font(.system(size: 22, weight: .medium))
+            Text("Your music. Less noise.")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+            Button(model.busy ? "Connecting…" : "Connect Spotify") {
+                Task { await model.connect() }
+            }
+            .disabled(model.busy)
+            .font(.system(size: 13, weight: .medium))
+            .buttonStyle(.borderless)
+            .tint(MusicPalette.spotifyGreen)
+            Text("Sign-in opens in your browser.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var signIn: some View {
