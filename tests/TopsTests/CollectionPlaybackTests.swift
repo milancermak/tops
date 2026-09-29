@@ -8,7 +8,9 @@ final class CollectionPlaybackTests: XCTestCase {
         MusicItem(id: "spotify:\(kind):\(name)", title: name, subtitle: "Artist", imageURL: nil, kind: kind)
     }
 
-    private func fixture() throws -> (AppModel, URL) {
+    private func fixture(
+        collectionLoader: ((MusicItem, Int) async throws -> MusicCollection)? = nil
+    ) throws -> (AppModel, URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("tops-collection-playback-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -34,11 +36,13 @@ final class CollectionPlaybackTests: XCTestCase {
         """#.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
         let engine = EngineClient(executableURL: executable, dataDirectoryURL: directory)
-        let model = AppModel(engine: engine, systemVolume: CollectionPlaybackVolume(), collectionLoader: { selected, _ in
+        let defaultLoader: (MusicItem, Int) async throws -> MusicCollection = { selected, _ in
             let track = CollectionTrack(id: "\(selected.id):0", uri: "spotify:track:first", title: "First",
                                         artist: "Artist", durationMS: 180_000, imageURL: nil, isPlayable: true)
             return MusicCollection(item: selected, tracks: [track], totalCount: 1, nextOffset: nil)
-        })
+        }
+        let model = AppModel(engine: engine, systemVolume: CollectionPlaybackVolume(),
+                             collectionLoader: collectionLoader ?? defaultLoader)
         model.connected = true
         return (model, directory)
     }
@@ -156,6 +160,30 @@ final class CollectionPlaybackTests: XCTestCase {
         XCTAssertEqual(model.playbackCollectionID, selected.id)
     }
 
+    func testSameTrackEventBeforeCollectionPlayAcknowledgementKeepsActualTrackMetadata() async throws {
+        let (model, directory) = try fixture()
+        defer { model.shutdown(); try? FileManager.default.removeItem(at: directory) }
+        let previous = item("previous-context"), selected = item("new-context")
+        await model.toggleCollectionPlayback(previous)
+        model.handleEvent("playback", [
+            "track_uri": "spotify:track:shared", "title": "Shared song", "artist": "Shared artist",
+            "is_playing": true, "position_ms": 12_000.0, "duration_ms": 180_000.0,
+        ])
+        // The next collection starts with the exact same song. Its engine event
+        // arrives before the command acknowledgement, without changing the URI.
+        try #"{"event":"playback","data":{"track_uri":"spotify:track:shared","title":"Shared song","artist":"Shared artist","is_playing":true,"position_ms":250,"duration_ms":180000}}"#
+            .appending("\n").write(to: directory.appendingPathComponent("event-before-ack"), atomically: true, encoding: .utf8)
+        await model.toggleCollectionPlayback(selected)
+        XCTAssertEqual(try requests(in: directory).compactMap(\.params.uri), [previous.id, selected.id])
+        XCTAssertEqual(model.playbackCollectionID, selected.id)
+        XCTAssertEqual(model.nowPlaying?.id, "spotify:track:shared")
+        XCTAssertEqual(model.nowPlaying?.kind, "track", "The acknowledgement must not replace the actual song with playlist metadata")
+        XCTAssertEqual(model.nowPlaying?.title, "Shared song")
+        XCTAssertEqual(model.nowPlaying?.subtitle, "Shared artist")
+        XCTAssertEqual(model.playback.positionMS, 250)
+        XCTAssertEqual(model.playback.durationMS, 180_000)
+    }
+
     func testDisconnectBeforePlayAcknowledgementCannotRestoreClearedContext() async throws {
         let (model, directory) = try fixture()
         defer { model.shutdown(); try? FileManager.default.removeItem(at: directory) }
@@ -166,6 +194,111 @@ final class CollectionPlaybackTests: XCTestCase {
         XCTAssertNil(model.nowPlaying)
         XCTAssertNil(model.playbackCollectionID)
         XCTAssertNil(model.error)
+    }
+
+    func testKeyboardToggleStartsSelectedCollectionWhileLoadingThenTogglesSameContext() async throws {
+        let started = expectation(description: "Selected collection is still loading")
+        var response: CheckedContinuation<MusicCollection, Error>?
+        let (model, directory) = try fixture(collectionLoader: { _, _ in
+            try await withCheckedThrowingContinuation {
+                response = $0
+                started.fulfill()
+            }
+        })
+        defer { model.shutdown(); try? FileManager.default.removeItem(at: directory) }
+        let selected = item("selected-before-content")
+        let opening = Task { await model.openCollection(selected) }
+        await fulfillment(of: [started], timeout: 2)
+        XCTAssertNil(model.collection)
+        XCTAssertNil(model.nowPlaying)
+        XCTAssertTrue(model.canTogglePlayback, "Selecting a collection must enable Space before its tracks arrive")
+        await model.togglePlaybackFromSelection()
+        XCTAssertEqual(try requests(in: directory).compactMap(\.params.uri), [selected.id])
+        model.handleEvent("playback", ["track_uri": "spotify:track:first", "is_playing": true])
+        await model.togglePlaybackFromSelection()
+        model.handleEvent("playback", ["is_playing": false])
+        await model.togglePlaybackFromSelection()
+        XCTAssertEqual(try requests(in: directory).map(\.method), ["play", "pause", "resume"])
+        response?.resume(returning: MusicCollection(item: selected, tracks: [], totalCount: 0, nextOffset: nil))
+        await opening.value
+        XCTAssertTrue(model.canTogglePlayback, "Current-context playback must remain resumable even if metadata becomes empty")
+        await model.togglePlaybackFromSelection()
+        XCTAssertEqual(try requests(in: directory).map(\.method), ["play", "pause", "resume", "resume"])
+    }
+
+    func testKeyboardToggleStartsDifferentSelectionAndFallsBackToCurrentAfterClosing() async throws {
+        let (model, directory) = try fixture()
+        defer { model.shutdown(); try? FileManager.default.removeItem(at: directory) }
+        let old = item("old-context"), selected = item("new-selection")
+        let song = item("current-song", kind: "track")
+        await model.play(song, context: old)
+        model.handleEvent("playback", ["track_uri": song.id, "is_playing": true])
+        await model.openCollection(selected)
+        XCTAssertEqual(model.nowPlaying?.id, song.id, "Browsing must leave the actual playing song untouched")
+        await model.togglePlaybackFromSelection()
+        XCTAssertEqual(try requests(in: directory).compactMap(\.params.uri), [song.id, selected.id])
+        XCTAssertEqual(model.playbackCollectionID, selected.id)
+        model.handleEvent("playback", ["track_uri": "spotify:track:new-song", "is_playing": false])
+        model.closeCollection()
+        XCTAssertTrue(model.canTogglePlayback)
+        await model.togglePlaybackFromSelection()
+        XCTAssertEqual(try requests(in: directory).map(\.method), ["play", "play", "resume"])
+        model.handleEvent("disconnected", [:])
+        XCTAssertFalse(model.canTogglePlayback)
+        await model.togglePlaybackFromSelection()
+        XCTAssertEqual(try requests(in: directory).count, 3)
+    }
+
+    func testKnownEmptyOrUnplayableSelectionDoesNotStartUnrelatedCurrentPlayback() async throws {
+        let (model, directory) = try fixture(collectionLoader: { selected, _ in
+            let tracks = selected.title == "empty" ? [] : [
+                CollectionTrack(id: "\(selected.id):0", uri: "spotify:track:unavailable", title: "Unavailable",
+                                artist: "Artist", durationMS: nil, imageURL: nil, isPlayable: false)
+            ]
+            return MusicCollection(item: selected, tracks: tracks, totalCount: tracks.count, nextOffset: nil)
+        })
+        defer { model.shutdown(); try? FileManager.default.removeItem(at: directory) }
+        for selected in [item("empty"), item("unplayable")] {
+            await model.openCollection(selected)
+            XCTAssertFalse(model.canTogglePlayback)
+            await model.togglePlaybackFromSelection()
+        }
+        XCTAssertTrue(try requests(in: directory).isEmpty)
+        model.handleEvent("playback", ["track_uri": "spotify:track:actual", "title": "Actual", "is_playing": true])
+        XCTAssertFalse(model.canTogglePlayback, "An invalid selection must not make Space control an unrelated collection")
+        await model.togglePlaybackFromSelection()
+        XCTAssertTrue(try requests(in: directory).isEmpty)
+        XCTAssertEqual(model.nowPlaying?.id, "spotify:track:actual")
+        model.closeCollection()
+        XCTAssertTrue(model.canTogglePlayback)
+        await model.togglePlaybackFromSelection()
+        XCTAssertEqual(try requests(in: directory).map(\.method), ["pause"])
+    }
+
+    func testClosingSelectionDisablesKeyboardWhenNothingHasPlayed() async throws {
+        let (model, directory) = try fixture()
+        defer { model.shutdown(); try? FileManager.default.removeItem(at: directory) }
+        await model.openCollection(item("selected"))
+        XCTAssertTrue(model.canTogglePlayback)
+        XCTAssertNil(model.nowPlaying)
+        model.closeCollection()
+        XCTAssertFalse(model.canTogglePlayback)
+        await model.togglePlaybackFromSelection()
+        XCTAssertTrue(try requests(in: directory).isEmpty)
+    }
+
+    func testUnplayableFirstPageWithContinuationStillAllowsStartingCollection() async throws {
+        let (model, directory) = try fixture(collectionLoader: { selected, _ in
+            let unavailable = CollectionTrack(id: "\(selected.id):0", uri: "spotify:track:unavailable", title: "Unavailable",
+                                              artist: "Artist", durationMS: nil, imageURL: nil, isPlayable: false)
+            return MusicCollection(item: selected, tracks: [unavailable], totalCount: 100, nextOffset: 50)
+        })
+        defer { model.shutdown(); try? FileManager.default.removeItem(at: directory) }
+        let selected = item("more-pages")
+        await model.openCollection(selected)
+        XCTAssertTrue(model.canTogglePlayback, "An incomplete first page cannot establish the entire collection is unplayable")
+        await model.togglePlaybackFromSelection()
+        XCTAssertEqual(try requests(in: directory).compactMap(\.params.uri), [selected.id])
     }
 }
 

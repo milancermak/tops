@@ -39,10 +39,14 @@ final class AppModel: ObservableObject {
     var visibleHomeShelves: [Shelf] { HomeShelves.visible(in: shelves) }
     @Published var results: [MusicItem] = []
     @Published private(set) var searchLoading = false
-    @Published var collection: MusicCollection?
+    @Published var collection: MusicCollection? {
+        didSet { updateMediaControls() }
+    }
     @Published var collectionLoading = false
     @Published var collectionError: String?
-    @Published var nowPlaying: MusicItem?
+    @Published var nowPlaying: MusicItem? {
+        didSet { updateMediaControls() }
+    }
     @Published private(set) var playbackCollectionID: String?
     @Published var status = "Connect to start listening"
 
@@ -69,7 +73,9 @@ final class AppModel: ObservableObject {
     private var collectionRefreshing = false
     private var collectionFailedOffset: Int?
     private var collectionSnapshot = 0
-    private var collectionItem: MusicItem?
+    @Published private var collectionItem: MusicItem? {
+        didSet { updateMediaControls() }
+    }
     private var playbackRequestRevision = 0
     private var playbackTrackRevision = 0
     private lazy var collectionStore: CollectionStore = {
@@ -108,25 +114,31 @@ final class AppModel: ObservableObject {
         let controls = system ?? NativeMediaControlSystem()
         mediaControls = controls
         controls.onCommand = { [weak self] action in
-            guard let self, self.connected, self.nowPlaying != nil else { return }
+            guard let self, self.connected else { return }
             switch action {
-            case .play: await self.command("resume")
-            case .pause: await self.command("pause")
-            case .togglePlayPause: await self.togglePlayback()
-            case .previous: await self.previous()
-            case .next: await self.next()
+            case .play: await self.playFromSelection()
+            case .togglePlayPause: await self.togglePlaybackFromSelection()
+            case .pause:
+                if self.nowPlaying != nil { await self.command("pause") }
+            case .previous:
+                if self.nowPlaying != nil { await self.previous() }
+            case .next:
+                if self.nowPlaying != nil { await self.next() }
             }
         }
         updateMediaControls()
     }
 
     private func updateMediaControls() {
-        guard connected, let item = nowPlaying else {
+        guard connected, let item = nowPlaying ?? (canTogglePlayback ? collectionItem : nil) else {
             mediaControls?.update(nil)
             return
         }
-        mediaControls?.update(.init(item: item, isPlaying: playback.isPlaying,
-                                   positionMS: playback.positionMS, durationMS: playback.durationMS))
+        let hasPlayback = nowPlaying != nil
+        mediaControls?.update(.init(item: item, isPlaying: hasPlayback && playback.isPlaying,
+                                   positionMS: hasPlayback ? playback.positionMS : 0,
+                                   durationMS: hasPlayback ? playback.durationMS : 0,
+                                   hasCurrentPlayback: hasPlayback, canPlay: canTogglePlayback))
     }
 
     func connect() async {
@@ -366,8 +378,8 @@ final class AppModel: ObservableObject {
 
     func closeCollection() {
         cancelCollectionRequest()
-        collection = nil
         collectionItem = nil
+        collection = nil
         collectionError = nil
         collectionFailedOffset = nil
     }
@@ -452,6 +464,40 @@ final class AppModel: ObservableObject {
         connected && nowPlaying != nil && playbackCollectionID == item.id
     }
 
+    private var canStartSelectedCollection: Bool {
+        guard let item = collectionItem, ["playlist", "album", "artist"].contains(item.kind) else { return false }
+        // Playback resolves the URI itself, so a cold or failed content fetch
+        // must not delay the keyboard. Only a known exhausted list can rule it out.
+        guard let collection, collection.item.id == item.id else { return true }
+        return collection.nextOffset != nil || collection.tracks.contains(where: \.isPlayable)
+    }
+
+    var canTogglePlayback: Bool {
+        guard connected else { return false }
+        if let item = collectionItem {
+            return isCurrentPlaybackContext(collection: item) || canStartSelectedCollection
+        }
+        return nowPlaying != nil
+    }
+
+    /// Space and media toggle use the selected collection, then the current song
+    /// when browsing the library without a selection.
+    func togglePlaybackFromSelection() async {
+        guard canTogglePlayback else { return }
+        if let item = collectionItem { await toggleCollectionPlayback(item) }
+        else { await togglePlayback() }
+    }
+
+    private func playFromSelection() async {
+        guard canTogglePlayback else { return }
+        if let item = collectionItem, !isCurrentPlaybackContext(collection: item) {
+            await play(item, context: item)
+        } else {
+            // An explicit Play command must never pause an already-playing song.
+            await command("resume")
+        }
+    }
+
     func toggleCollectionPlayback(_ item: MusicItem) async {
         guard connected else { return }
         if isCurrentPlaybackContext(collection: item) {
@@ -465,6 +511,7 @@ final class AppModel: ObservableObject {
 
     private func setPlaybackContext(_ id: String?) {
         if playbackCollectionID != id { playbackCollectionID = id }
+        updateMediaControls()
     }
 
     func play(_ item: MusicItem, context: MusicItem? = nil) async {
@@ -520,7 +567,9 @@ final class AppModel: ObservableObject {
                 durationMS: data["duration_ms"] as? Double
             )
             if let uri = data["track_uri"] as? String {
-                if nowPlaying?.id != uri { playbackTrackRevision += 1 }
+                // Even the same song is authoritative: another collection can
+                // start with it before its play request returns.
+                playbackTrackRevision += 1
                 // The helper has no context ID. A next track may be beyond the
                 // cached page, so track changes cannot reliably clear context.
                 if let title = data["title"] as? String {

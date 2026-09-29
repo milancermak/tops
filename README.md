@@ -21,8 +21,12 @@ pauses/resumes its playback. The native titlebar shows **Tops - Song by Artist**
 **View → Interface → Artwork** switches to the cover-based interface immediately;
 **Text** switches back. The choice is remembered, and switching preserves the
 connection, playback and open collection. Opening a collection does not start
-playback. Space toggles playback when the window has focus, while spaces typed
-into search remain ordinary text.
+playback. Space or the keyboard play key starts the selected collection; once
+that collection is playing, Space toggles pause/resume. With no collection open,
+Space controls the current song. Spaces typed into search remain ordinary text.
+Hover over a collection in the Text list to reveal its Play button on the right.
+This starts its queue without opening the detail; the button has its own space
+beside the text and also appears when either row action has keyboard focus.
 
 The original HTTP 403 was isolated to User-Agent filtering; adding the tested
 Spotify desktop User-Agent made the same saved-token request succeed. The app
@@ -93,7 +97,8 @@ play/pause outside text editing and focused native controls; key repeats and
 modified Space presses are ignored. Cmd-F focuses search; Cmd-R refreshes
 recommendations. Closing the window quits the app and its playback process.
 The keyboard's previous, play/pause and next media keys work through macOS Now
-Playing, including while Tops is in the background. Start a track in Tops first;
+Playing, including while Tops is in the background. Selecting a collection
+makes Play available before any track has started.
 macOS decides which media app receives the keys when several apps are open.
 Playback metadata and controls clear when Tops disconnects or quits. No
 Accessibility or Input Monitoring permission is needed.

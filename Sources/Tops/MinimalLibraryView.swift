@@ -185,34 +185,16 @@ struct MinimalLibraryView: View {
     }
 
     private func collectionRow(_ item: MusicItem) -> some View {
-        Button {
+        MinimalSidebarCollectionRow(item: item, isSelected: selectedCollection?.id == item.id,
+                                    enabled: model.connected) {
             if item.kind == "track" {
                 Task { await model.play(item) }
             } else {
                 openCollection(item)
             }
-        } label: {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.title)
-                    .font(.system(size: 14, weight: .medium))
-                    .tracking(-0.1)
-                if !item.subtitle.isEmpty {
-                    Text(item.subtitle)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .lineSpacing(1)
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 6)
-            .contentShape(Rectangle())
+        } playCollection: {
+            Task { await model.play(item, context: item) }
         }
-        .buttonStyle(MinimalRowButtonStyle(isSelected: selectedCollection?.id == item.id))
-        .disabled(!model.connected)
-        .accessibilityLabel("\(item.kind == "track" ? "Play" : "Open") \(item.title), \(item.subtitle)")
-        .accessibilityValue(selectedCollection?.id == item.id ? "Selected collection" : "")
     }
 
     private func collectionDetail(_ selected: MusicItem) -> some View {
@@ -343,6 +325,90 @@ struct MinimalLibraryView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(MinimalRowButtonStyle())
+    }
+}
+
+private struct MinimalSidebarCollectionRow: View {
+    let item: MusicItem
+    let isSelected: Bool
+    let enabled: Bool
+    let activate: () -> Void
+    let playCollection: () -> Void
+
+    private enum Action: Hashable { case open, play }
+    @State private var hovered = false
+    @State private var playHovered = false
+    @FocusState private var focusedAction: Action?
+    @AccessibilityFocusState private var accessibilityFocusedAction: Action?
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var palette: MinimalLibraryPalette { .init(colorScheme: colorScheme) }
+    private var hasFocus: Bool { focusedAction != nil || accessibilityFocusedAction != nil }
+    private var highlighted: Bool { isSelected || (enabled && (hovered || hasFocus)) }
+    private var showPlay: Bool { hovered || hasFocus }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button(action: activate) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.title)
+                        .font(.system(size: 14, weight: .medium))
+                        .tracking(-0.1)
+                    if !item.subtitle.isEmpty {
+                        Text(item.subtitle)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineSpacing(1)
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 14)
+                .padding(.trailing, item.kind == "track" ? 14 : 0)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .focused($focusedAction, equals: .open)
+            .accessibilityFocused($accessibilityFocusedAction, equals: .open)
+            .accessibilityLabel("\(item.kind == "track" ? "Play" : "Open") \(item.title), \(item.subtitle)")
+            .accessibilityValue(isSelected ? "Selected collection" : "")
+
+            if item.kind != "track" {
+                // Keep this lane in the layout and accessibility tree when its
+                // glyph is hidden. Text never moves when either action receives focus.
+                Button(action: playCollection) {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .offset(x: 1)
+                        .foregroundStyle(Color(red: 16.0 / 255, green: 33.0 / 255, blue: 20.0 / 255))
+                        .frame(width: 28, height: 28)
+                        .background(playHovered
+                                    ? Color(red: 30.0 / 255, green: 215.0 / 255, blue: 96.0 / 255)
+                                    : Color(red: 29.0 / 255, green: 185.0 / 255, blue: 84.0 / 255),
+                                    in: Circle())
+                        .opacity(showPlay ? 1 : 0)
+                        .padding(.leading, 8)
+                        .padding(.trailing, 14)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .fixedSize()
+                .focused($focusedAction, equals: .play)
+                .accessibilityFocused($accessibilityFocusedAction, equals: .play)
+                .accessibilityLabel("Play \(item.title)")
+                .accessibilityHidden(false)
+                .help("Play \(item.title)")
+                .onHover { playHovered = $0 }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .foregroundStyle(highlighted ? palette.highlightInk : palette.ink,
+                         highlighted ? palette.highlightSecondary : palette.secondary)
+        .background(isSelected ? palette.selection : highlighted ? palette.hover : .clear)
+        .contentShape(Rectangle())
+        .disabled(!enabled)
+        .onHover { hovered = $0 }
     }
 }
 

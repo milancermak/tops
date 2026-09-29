@@ -10,6 +10,15 @@ struct MediaPlaybackSnapshot: Equatable {
     var isPlaying: Bool
     var positionMS: Double
     var durationMS: Double
+    var hasCurrentPlayback = true
+    var canPlay = true
+
+    func canHandle(_ command: MediaCommand) -> Bool {
+        switch command {
+        case .play, .togglePlayPause: return canPlay
+        case .pause, .previous, .next: return hasCurrentPlayback
+        }
+    }
 
     var nowPlayingInfo: [String: Any] {
         var info: [String: Any] = [
@@ -40,7 +49,7 @@ protocol MediaControlSystem: AnyObject {
 final class NativeMediaControlSystem: MediaControlSystem {
     var onCommand: (@MainActor (MediaCommand) async -> Void)?
     private let center = MPNowPlayingInfoCenter.default()
-    private var targets: [(MPRemoteCommand, Any)] = []
+    private var targets: [(command: MPRemoteCommand, action: MediaCommand, token: Any)] = []
     private var snapshot: MediaPlaybackSnapshot?
     private var publishedAt = ProcessInfo.processInfo.systemUptime
     private var stopped = false
@@ -68,19 +77,19 @@ final class NativeMediaControlSystem: MediaControlSystem {
                 // MediaPlayer may call from a background queue. Acknowledgement
                 // means queued; engine events remain the playback source of truth.
                 Task { @MainActor [weak self] in
-                    guard let self, !self.stopped, self.snapshot != nil else { return }
+                    guard let self, !self.stopped, self.snapshot?.canHandle(action) == true else { return }
                     await self.onCommand?(action)
                 }
                 return .success
             }
             let target = command.addTarget(handler: handler)
-            targets.append((command, target))
+            targets.append((command, action, target))
         }
     }
 
     func update(_ newSnapshot: MediaPlaybackSnapshot?) {
         guard !stopped else { return }
-        for (command, _) in targets { command.isEnabled = newSnapshot != nil }
+        for target in targets { target.command.isEnabled = newSnapshot?.canHandle(target.action) == true }
         guard let newSnapshot else {
             if snapshot != nil {
                 center.playbackState = .stopped
@@ -94,7 +103,9 @@ final class NativeMediaControlSystem: MediaControlSystem {
         if let previous = snapshot,
            previous.item == newSnapshot.item,
            previous.isPlaying == newSnapshot.isPlaying,
-           previous.durationMS == newSnapshot.durationMS {
+           previous.durationMS == newSnapshot.durationMS,
+           previous.hasCurrentPlayback == newSnapshot.hasCurrentPlayback,
+           previous.canPlay == newSnapshot.canPlay {
             // macOS extrapolates elapsed time itself. Publish seeks/corrections,
             // not every one-second progress tick from the engine.
             let expected = previous.positionMS + (previous.isPlaying ? (now - publishedAt) * 1_000 : 0)
@@ -112,14 +123,14 @@ final class NativeMediaControlSystem: MediaControlSystem {
         update(nil)
         stopped = true
         onCommand = nil
-        for (command, target) in targets {
-            command.removeTarget(target)
-            command.isEnabled = false
+        for target in targets {
+            target.command.removeTarget(target.token)
+            target.command.isEnabled = false
         }
         targets.removeAll()
     }
 
     deinit {
-        for (command, target) in targets { command.removeTarget(target) }
+        for target in targets { target.command.removeTarget(target.token) }
     }
 }

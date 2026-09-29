@@ -37,8 +37,8 @@ struct TopsApp: App {
         Window(model.windowTitle, id: "main") {
             ContentView(model: model, interface: interface)
                 .background {
-                    PlaybackKeyboardShortcut(enabled: model.connected && model.nowPlaying != nil) {
-                        Task { await model.togglePlayback() }
+                    PlaybackKeyboardShortcut(enabled: model.canTogglePlayback) {
+                        Task { await model.togglePlaybackFromSelection() }
                     }
                 }
                 .onAppear {
