@@ -38,8 +38,10 @@ Spotify can change without notice.
 ## Try it
 
 First [build from source](#build); `dist/Tops.app` is generated locally and is not
-included in the repository. Open it, then choose **Connect Spotify**. Sign in on Spotify's own
-website and return to Tops. It requires Premium. There is no developer-dashboard
+included in the repository. Open it and Tops connects to Spotify automatically,
+reusing or refreshing saved credentials. When sign-in is needed, Spotify's own
+website opens in your browser; sign in and return to Tops. If the connection fails,
+choose **Connect Spotify** to retry. It requires Premium. There is no developer-dashboard
 registration or client secret to enter. Playback starts only when you choose music.
 
 ```sh
@@ -102,7 +104,7 @@ makes Play available before any track has started.
 macOS decides which media app receives the keys when several apps are open.
 Playback metadata and controls clear when Tops disconnects or quits. No
 Accessibility or Input Monitoring permission is needed.
-Search pagination, automatic reconnect, offline playback, shuffle
+Search pagination, automatic reconnect after a connection drops while running, offline playback, shuffle
 and repeat are not implemented.
 
 In Artwork mode, the bottom player arranges track information, transport buttons, progress and

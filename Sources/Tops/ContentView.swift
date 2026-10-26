@@ -57,7 +57,6 @@ struct ContentView: View {
                             if destination == .search { searchContent }
                             else { recommendations }
                         }
-                        // Keep the source scroll position for Back, including lazy grids.
                         .opacity(selectedCollection == nil || collectionReturnID != nil ? 1 : 0)
                         .allowsHitTesting(selectedCollection == nil)
                         .accessibilityHidden(selectedCollection != nil)
@@ -68,8 +67,6 @@ struct ContentView: View {
                                 .allowsHitTesting(!collectionReturning)
                                 .background(Color(nsColor: .windowBackgroundColor))
                                 .opacity(collectionReturning || coverFlight?.started == false ? 0 : 1)
-                                // Only fade on entry. Ending the flight must not fade
-                                // the destination cover up from zero after its overlay vanishes.
                                 .animation(.easeOut(duration: 0.12), value: coverFlight?.started == false)
                                 .animation(reduceMotion ? nil : CollectionMotion.animation, value: collectionReturning)
                         }
@@ -130,14 +127,16 @@ struct ContentView: View {
                         .accessibilityLabel("Settings")
                     }
                 }
-                // One expanding native item keeps the trailing field anchored on macOS 14+.
-                // Reserve the titlebar's traffic lights and outer insets.
                 .frame(width: max(0, contentWidth - 128))
             }
             }
         }
         .task {
-            if model.connected { await model.refresh() }
+            if model.connected {
+                await model.refresh()
+            } else {
+                await model.connect()
+            }
         }
         .onChange(of: model.query) { _, _ in songsExpanded = false }
         .onChange(of: interface) { _, _ in
@@ -221,16 +220,12 @@ struct ContentView: View {
             return
         }
         if coverFlight != nil {
-            // Finish an entrance already in motion before returning, instead of
-            // dropping its moving cover and snapping to the detail's final frame.
             pendingCollectionReturn = target
             return
         }
 
         let returnID = UUID()
         collectionReturnID = returnID
-        // Prepare the destination behind the detail first. Home and Back then
-        // share exactly the same animation and deferred teardown, even from Search.
         if destination != target { destination = target }
         DispatchQueue.main.async {
             guard collectionReturnID == returnID else { return }
@@ -241,7 +236,6 @@ struct ContentView: View {
                 collectionReturning = true
             } completion: {
                 guard collectionReturnID == returnID else { return }
-                // Keep the detail and toolbar intact until the return finishes.
                 withTransaction(transaction) { closeCollection(resignSearch: false) }
             }
         }
@@ -285,11 +279,9 @@ struct ContentView: View {
         guard let flight = coverFlight, flight.item.id == item.id,
               frame.width > 0, frame.height > 0 else { return }
         if flight.started {
-            // A window resize can move the destination even while scrolling is locked.
             coverFlight?.frame = frame
             return
         }
-        // Wait until the destination has a layout before beginning the flight.
         DispatchQueue.main.async {
             guard coverFlight?.id == flight.id, coverFlight?.started == false else { return }
             withAnimation(CollectionMotion.animation, completionCriteria: .removed) {
@@ -298,7 +290,6 @@ struct ContentView: View {
                 coverFlight?.frame = frame
             } completion: {
                 guard coverFlight?.id == flight.id else { return }
-                // Swap the overlay for the already-rendered cover in one frame.
                 var transaction = Transaction(animation: nil)
                 transaction.disablesAnimations = true
                 withTransaction(transaction) { coverFlight = nil }
@@ -630,8 +621,6 @@ struct ContentView: View {
     }
 }
 
-/// Keep both controls in one stable toolbar slot. Inserting/removing a native
-/// toolbar button changes AppKit's layout immediately and can rebuild its view.
 private struct CollectionNavigationButtons: View {
     let expanded: Bool
     let canGoBack: Bool
@@ -673,8 +662,6 @@ private struct CollectionNavigationButtonStyle: ButtonStyle {
         configuration.label
             .contentShape(Rectangle())
             .opacity(configuration.isPressed ? 0.72 : 1)
-            // A pressed Home button moves away from the pointer. Its press
-            // feedback must not inherit the slide/fade animation around it.
             .animation(nil, value: configuration.isPressed)
     }
 }
@@ -791,7 +778,6 @@ private struct Artwork: View {
                     image = thumbnail
                     onImageChange?(thumbnail)
                 } catch {
-                    // Failed or cancelled artwork keeps the lightweight placeholder.
                 }
             }
             .onDisappear { releaseImage() }
