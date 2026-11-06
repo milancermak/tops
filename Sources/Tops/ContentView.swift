@@ -45,6 +45,7 @@ struct ContentView: View {
                         MinimalLibraryView(model: model, selectedCollection: $selectedCollection,
                                            openCollection: { activate($0, from: .zero, image: nil) },
                                            closeCollection: { closeCollection() },
+                                           togglePlaybackCollection: togglePlaybackCollection,
                                            searchVisible: destination == .search,
                                            searchFocusRequest: searchFocusRequest,
                                            hideSearch: {
@@ -91,7 +92,8 @@ struct ContentView: View {
 
             if model.connected && interface == .artwork {
                 Divider()
-                PlaybackBar(model: model)
+                PlaybackBar(model: model, selectedCollectionID: selectedCollection?.id,
+                            togglePlaylist: togglePlaybackCollection)
             }
         }
         .frame(minWidth: interface == .text ? 280 : 800, minHeight: interface == .text ? 500 : 550)
@@ -257,6 +259,17 @@ struct ContentView: View {
                 guard selectedCollection?.id == item.id else { return }
                 await model.openCollection(item)
             }
+        }
+    }
+
+    private func togglePlaybackCollection() {
+        guard let item = model.playbackCollection else { return }
+        if selectedCollection?.id == item.id {
+            if interface == .text { closeCollection() }
+            else { returnFromCollection(to: destination) }
+        } else {
+            guard coverFlight == nil, collectionReturnID == nil else { return }
+            activate(item, from: .zero, image: nil)
         }
     }
 
@@ -900,109 +913,135 @@ private struct TrackRow: View {
     }
 }
 
-private struct PlaybackBar: View {
+struct PlaybackBar: View {
     @ObservedObject var model: AppModel
     @ObservedObject private var playback: PlaybackState
-    @State private var seekPosition: Double = 0
-    @State private var scrubbing = false
+    let compact: Bool
+    let selectedCollectionID: String?
+    let togglePlaylist: () -> Void
 
-    init(model: AppModel) {
+    init(model: AppModel, compact: Bool = false, selectedCollectionID: String?, togglePlaylist: @escaping () -> Void) {
         self.model = model
         self.playback = model.playback
+        self.compact = compact
+        self.selectedCollectionID = selectedCollectionID
+        self.togglePlaylist = togglePlaylist
+    }
+
+    private var canControl: Bool { model.connected && model.nowPlaying != nil }
+    private var playlistOpen: Bool {
+        model.playbackCollectionID != nil && model.playbackCollectionID == selectedCollectionID
     }
 
     var body: some View {
-        HStack(spacing: 18) {
-            Group {
-                if model.connected, let nowPlaying = model.nowPlaying {
-                    HStack(spacing: 11) {
-                        Artwork(url: nowPlaying.imageURL, cornerRadius: 6)
-                            .frame(width: MusicLayout.trackArtworkSize, height: MusicLayout.trackArtworkSize)
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(nowPlaying.title)
-                                .font(.system(size: 12, weight: .semibold))
-                                .lineLimit(1)
-                            Text(nowPlaying.subtitle)
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
+        Group {
+            if compact {
+                VStack(spacing: 6) {
+                    if let track = model.nowPlaying {
+                        let artist = track.kind == "track" ? track.subtitle.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                        let title = artist.isEmpty ? track.title : "\(track.title) - \(artist)"
+                        Text(title)
+                            .font(.system(size: 12, weight: .semibold))
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity)
+                            .help(title)
                     }
-                } else {
-                    Color.clear
+                    seekSlider
+                    transport
+                        .frame(maxWidth: .infinity)
+                        .overlay(alignment: .trailing) { playlistButton }
+                }
+            } else {
+                HStack(spacing: 18) {
+                    metadata.frame(width: 245, alignment: .leading)
+                    transport
+                    seekSlider
+                    volumeSlider.frame(width: 122)
+                    playlistButton
                 }
             }
-            .frame(width: 245, height: MusicLayout.trackArtworkSize, alignment: .leading)
-            .accessibilityHidden(!model.connected || model.nowPlaying == nil)
+        }
+        .padding(.horizontal, compact ? 14 : MusicLayout.contentInset)
+        .padding(.vertical, compact ? 8 : 14)
+        .foregroundStyle(Color.primary)
+        .background(.bar)
+    }
 
-            HStack(spacing: 16) {
-                transportButton("backward.end.fill", label: "Previous track") {
-                    await model.previous()
-                }
-                Button {
-                    Task { await model.togglePlayback() }
-                } label: {
-                    Image(systemName: playback.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 33))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
-                .help(playback.isPlaying ? "Pause" : "Play")
-                .disabled(!model.connected || model.nowPlaying == nil)
-
-                transportButton("forward.end.fill", label: "Next track") {
-                    await model.next()
-                }
-            }
-
-            HStack(spacing: 8) {
-                Text(time(scrubbing ? seekPosition : playback.positionMS))
-                    .frame(width: 35, alignment: .trailing)
-                Slider(value: $seekPosition, in: 0...max(playback.durationMS, 1)) { editing in
-                    scrubbing = editing
-                    if !editing {
-                        let target = seekPosition
-                        Task { await model.seek(target) }
+    private var metadata: some View {
+        Group {
+            if model.connected, let nowPlaying = model.nowPlaying {
+                HStack(spacing: 11) {
+                    Artwork(url: nowPlaying.imageURL, cornerRadius: 6)
+                        .frame(width: MusicLayout.trackArtworkSize, height: MusicLayout.trackArtworkSize)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(nowPlaying.title)
+                            .font(.system(size: 12, weight: .semibold))
+                            .lineLimit(1)
+                            .help(nowPlaying.title)
+                        Text(nowPlaying.subtitle)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .controlSize(.mini)
-                .tint(MusicPalette.spotifyGreen)
-                .disabled(model.nowPlaying == nil || playback.durationMS <= 0)
-                .accessibilityLabel("Playback position")
-                Text(time(playback.durationMS))
-                    .frame(width: 35, alignment: .leading)
+            } else {
+                Color.clear
             }
-            .font(.system(size: 10, design: .monospaced))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity)
+        }
+        .frame(height: MusicLayout.trackArtworkSize, alignment: .leading)
+        .accessibilityHidden(!canControl)
+    }
 
-            HStack(spacing: 8) {
-                Image(systemName: playback.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Slider(value: Binding(get: { playback.volume }, set: { model.setVolume($0) }), in: 0...100)
+    private var transport: some View {
+        HStack(spacing: 16) {
+            transportButton("backward.end.fill", label: "Previous track", action: model.previous)
+            Button {
+                Task { await model.togglePlayback() }
+            } label: {
+                Image(systemName: playback.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                    .font(.system(size: 33))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
+            .help(playback.isPlaying ? "Pause" : "Play")
+            transportButton("forward.end.fill", label: "Next track", action: model.next)
+        }
+        .disabled(!canControl)
+    }
+
+    private var seekSlider: some View {
+        PlaybackSeekSlider(playback: playback, canSeek: canControl, seek: model.seek)
+    }
+
+    private var volumeSlider: some View {
+        HStack(spacing: 8) {
+            Image(systemName: playback.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Slider(value: Binding(get: { playback.volume }, set: { model.setVolume($0) }), in: 0...100)
                 .controlSize(.mini)
                 .tint(MusicPalette.spotifyGreen)
                 .disabled(!playback.volumeAvailable)
                 .help(playback.volumeAvailable ? "System volume" : "This output device does not support system volume control")
                 .accessibilityLabel("System volume")
                 .accessibilityValue(playback.volumeAvailable ? "\(Int(playback.volume.rounded())) percent" : "Unavailable for this output device")
-            }
-            .frame(width: 122)
         }
-        .padding(.horizontal, MusicLayout.contentInset)
-        .padding(.vertical, 14)
-        .background(.bar)
-        .onAppear {
-            seekPosition = max(0, min(playback.positionMS, playback.durationMS))
+    }
+
+    private var playlistButton: some View {
+        Button(action: togglePlaylist) {
+            Image(systemName: "list.bullet")
+                .font(.system(size: 13))
+                .foregroundStyle(playlistOpen ? MusicPalette.spotifyGreen : Color.primary)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
         }
-        .onChange(of: playback.positionMS) { _, value in
-            if !scrubbing { seekPosition = max(0, min(value, playback.durationMS)) }
-        }
-        .onChange(of: playback.durationMS) { _, value in
-            seekPosition = max(0, min(seekPosition, value))
-        }
+        .buttonStyle(.plain)
+        .disabled(model.playbackCollection == nil)
+        .accessibilityLabel("Playlist")
+        .accessibilityValue(playlistOpen ? "Expanded" : "Collapsed")
+        .help(playlistOpen ? "Close playing playlist" : "Open playing playlist")
     }
 
     private func transportButton(_ symbol: String, label: String, action: @escaping @MainActor () async -> Void) -> some View {
@@ -1016,7 +1055,45 @@ private struct PlaybackBar: View {
         .buttonStyle(.plain)
         .accessibilityLabel(label)
         .help(label)
-        .disabled(!model.connected || model.nowPlaying == nil)
+    }
+}
+
+private struct PlaybackSeekSlider: View {
+    @ObservedObject var playback: PlaybackState
+    let canSeek: Bool
+    let seek: @MainActor (Double) async -> Void
+
+    @State private var positionMS = 0.0
+    @State private var scrubbing = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(time(scrubbing ? positionMS : playback.positionMS))
+                .frame(width: 35, alignment: .trailing)
+            Slider(value: $positionMS, in: 0...max(playback.durationMS, 1)) { editing in
+                scrubbing = editing
+                if !editing {
+                    let target = positionMS
+                    Task { await seek(target) }
+                }
+            }
+            .controlSize(.mini)
+            .tint(MusicPalette.spotifyGreen)
+            .disabled(!canSeek || playback.durationMS <= 0)
+            .accessibilityLabel("Playback position")
+            .frame(maxWidth: .infinity)
+
+            Text(time(playback.durationMS))
+                .frame(width: 35, alignment: .leading)
+        }
+        .font(.system(size: 10, design: .monospaced))
+        .foregroundStyle(.secondary)
+        .onChange(of: playback.positionMS, initial: true) { _, value in
+            if !scrubbing { positionMS = max(0, min(value, playback.durationMS)) }
+        }
+        .onChange(of: playback.durationMS) { _, value in
+            positionMS = max(0, min(scrubbing ? positionMS : playback.positionMS, value))
+        }
     }
 
     private func time(_ milliseconds: Double) -> String {

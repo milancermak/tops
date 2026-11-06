@@ -64,6 +64,15 @@ final class EngineClient {
         self.dataDirectoryURL = dataDirectoryURL
     }
 
+    var dataDirectory: URL {
+        if let dataDirectoryURL { return dataDirectoryURL }
+        if let path = ProcessInfo.processInfo.environment["TOPS_DATA_DIR"] {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Tops/session", isDirectory: true)
+    }
+
     func start() throws {
         if process?.isRunning == true { return }
         if process != nil {
@@ -81,11 +90,10 @@ final class EngineClient {
         guard let executable = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
             throw TopsError(message: "The playback engine has not been built. Run scripts/build-app.sh, then open dist/Tops.app.")
         }
-        let dataDir = dataDirectoryURL?.path ?? env["TOPS_DATA_DIR"] ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Tops/session").path
         let child = Process()
         let stdin = Pipe(), stdout = Pipe()
         child.executableURL = URL(fileURLWithPath: executable)
-        child.arguments = ["--data-dir", dataDir]
+        child.arguments = ["--data-dir", dataDirectory.path]
         // librespot creates a second Tokio runtime. Its default otherwise starts
         // one worker per CPU, beyond this small player's networking needs.
         child.environment = env.merging(["TOKIO_WORKER_THREADS": "2"]) { _, bounded in bounded }

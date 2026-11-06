@@ -9,9 +9,10 @@ final class CollectionPlaybackTests: XCTestCase {
     }
 
     private func fixture(
-        collectionLoader: ((MusicItem, Int) async throws -> MusicCollection)? = nil
+        collectionLoader: ((MusicItem, Int) async throws -> MusicCollection)? = nil,
+        restartingIn existingDirectory: URL? = nil
     ) throws -> (AppModel, URL) {
-        let directory = FileManager.default.temporaryDirectory
+        let directory = existingDirectory ?? FileManager.default.temporaryDirectory
             .appendingPathComponent("tops-collection-playback-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let executable = directory.appendingPathComponent("engine")
@@ -30,7 +31,15 @@ final class CollectionPlaybackTests: XCTestCase {
                 rm fail-next
                 printf '{"id":%s,"error":"Fixture play failure"}\n' "$id"
             else
-                printf '{"id":%s,"result":{}}\n' "$id"
+                case "$request" in
+                    *'"method":"authenticate"'*)
+                        account=fixture-account
+                        if [ -f account ]; then read -r account < account; fi
+                        printf '{"id":%s,"result":{"username":"%s"}}\n' "$id" "$account" ;;
+                    *'"method":"restore"'*)
+                        printf '{"id":%s,"result":{"context_restored":true}}\n' "$id" ;;
+                    *) printf '{"id":%s,"result":{}}\n' "$id" ;;
+                esac
             fi
         done
         """#.write(to: executable, atomically: true, encoding: .utf8)
@@ -42,15 +51,94 @@ final class CollectionPlaybackTests: XCTestCase {
             return MusicCollection(item: selected, tracks: [track], totalCount: 1, nextOffset: nil)
         }
         let model = AppModel(engine: engine, systemVolume: CollectionPlaybackVolume(),
-                             collectionLoader: collectionLoader ?? defaultLoader)
-        model.connected = true
+                             collectionLoader: collectionLoader ?? defaultLoader, feedLoader: { [] })
+        model.connected = existingDirectory == nil
         return (model, directory)
     }
 
     private struct Request: Decodable {
-        struct Params: Decodable { var uri: String? }
+        struct Params: Decodable {
+            var uri: String?
+            var contextURI: String?
+            var trackURI: String?
+            var positionMS: Int?
+            var startPlaying: Bool?
+
+            enum CodingKeys: String, CodingKey {
+                case uri, contextURI = "context_uri", trackURI = "track_uri"
+                case positionMS = "position_ms", startPlaying = "start_playing"
+            }
+        }
         var method: String
         var params: Params
+    }
+
+    func testRestartRestoresLatestConfirmedPlaylistPositionWithoutStartingAudio() async throws {
+        let (first, directory) = try fixture()
+        defer { first.shutdown(); try? FileManager.default.removeItem(at: directory) }
+        let playlist = item("saved-playlist")
+        let track = item("second", kind: "track")
+        await first.activateCollectionAccount("fixture-account")
+        await first.play(playlist)
+        for position in [20_000.0, 21_500.0] {
+            first.handleEvent("playback", ["track_uri": track.id, "title": track.title, "artist": track.subtitle,
+                                           "position_ms": position, "duration_ms": 180_000.0,
+                                           "is_playing": true, "position_confirmed": true])
+        }
+        first.handleEvent("playback", ["track_uri": "spotify:track:loading", "position_ms": 0.0,
+                                       "is_playing": false, "position_confirmed": false])
+        first.shutdown()
+
+        let (reopened, _) = try fixture(restartingIn: directory)
+        defer { reopened.shutdown() }
+        await reopened.connect()
+        XCTAssertEqual(reopened.nowPlaying, track)
+        XCTAssertEqual(reopened.playbackCollection, playlist)
+        XCTAssertEqual(reopened.playback.positionMS, 21_500)
+        XCTAssertFalse(reopened.playback.isPlaying)
+        XCTAssertEqual(try requests(in: directory).map(\.method), ["play", "authenticate"])
+
+        await reopened.seek(23_000)
+        XCTAssertEqual(reopened.playback.positionMS, 23_000)
+        XCTAssertEqual(try requests(in: directory).count, 2)
+        await reopened.togglePlayback()
+        let restore = try XCTUnwrap(requests(in: directory).last)
+        XCTAssertEqual(restore.method, "restore")
+        XCTAssertEqual(restore.params.contextURI, playlist.id)
+        XCTAssertEqual(restore.params.trackURI, track.id)
+        XCTAssertEqual(restore.params.positionMS, 23_000)
+        XCTAssertEqual(restore.params.startPlaying, true)
+        await reopened.next()
+        XCTAssertEqual(try requests(in: directory).last?.method, "next")
+    }
+
+    func testRestartKeepsStandaloneTrackSeparateFromItsSourceAndOtherAccounts() async throws {
+        let (first, directory) = try fixture()
+        defer { first.shutdown(); try? FileManager.default.removeItem(at: directory) }
+        let source = item("source"), track = item("track", kind: "track")
+        await first.activateCollectionAccount("fixture-account")
+        await first.play(track, context: source)
+        first.handleEvent("playback", ["track_uri": track.id, "title": track.title, "duration_ms": 90_000.0,
+                                       "position_ms": 5_000.0, "position_confirmed": true])
+        first.shutdown()
+
+        let (reopened, _) = try fixture(restartingIn: directory)
+        await reopened.connect()
+        XCTAssertEqual(reopened.playbackCollection, source)
+        await reopened.togglePlayback()
+        let restore = try XCTUnwrap(requests(in: directory).last)
+        XCTAssertEqual(restore.method, "restore")
+        XCTAssertNil(restore.params.contextURI)
+        XCTAssertEqual(restore.params.trackURI, track.id)
+        reopened.shutdown()
+
+        try "other-account\n".write(to: directory.appendingPathComponent("account"), atomically: true, encoding: .utf8)
+        let (other, _) = try fixture(restartingIn: directory)
+        defer { other.shutdown() }
+        await other.connect()
+        XCTAssertTrue(other.connected)
+        XCTAssertNil(other.nowPlaying)
+        XCTAssertNil(other.playbackCollection)
     }
 
     private func requests(in directory: URL) throws -> [Request] {
@@ -78,6 +166,25 @@ final class CollectionPlaybackTests: XCTestCase {
         await model.toggleCollectionPlayback(selected)
         XCTAssertEqual(try requests(in: directory).map(\.method), ["play", "pause", "resume"])
         XCTAssertEqual(model.playbackCollectionID, selected.id)
+    }
+
+    func testFooterFollowsPlaybackWhileBrowsingAnotherCollection() async throws {
+        let (model, directory) = try fixture()
+        defer { model.shutdown(); try? FileManager.default.removeItem(at: directory) }
+        let playing = item("search-playlist")
+        model.results = [playing]
+        await model.play(playing, context: playing)
+        model.clearSearch()
+        await model.openCollection(item("another-playlist"))
+        XCTAssertEqual(model.playbackCollection, playing)
+
+        model.handleEvent("playback", ["track_uri": "spotify:track:first", "title": "First", "is_playing": true])
+        await model.togglePlayback()
+        await model.next()
+        await model.previous()
+        XCTAssertEqual(try requests(in: directory).map(\.method), ["play", "pause", "next", "previous"])
+        model.handleEvent("disconnected", [:])
+        XCTAssertNil(model.playbackCollection)
     }
 
     func testBrowsingAndSwitchingCollectionsDoNotConfuseSelectionWithPlaybackContext() async throws {

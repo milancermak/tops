@@ -5,7 +5,7 @@ use oauth::{CLIENT_ID, OAuthStore, PlaybackTokenProvider, SharedOAuth};
 
 use anyhow::{Context, Result, bail};
 use librespot::{
-    connect::{ConnectConfig, LoadRequest, LoadRequestOptions, Spirc},
+    connect::{ConnectConfig, LoadRequest, LoadRequestOptions, PlayingTrack, Spirc},
     core::{
         SpotifyUri,
         authentication::Credentials,
@@ -18,7 +18,7 @@ use librespot::{
         audio_backend,
         config::{AudioFormat, Bitrate, PlayerConfig},
         mixer::{self, MixerConfig},
-        player::{Player, PlayerEvent},
+        player::{Player, PlayerEvent, PlayerEventChannel},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,14 @@ struct Request {
     method: String,
     #[serde(default)]
     params: Value,
+}
+
+#[derive(Deserialize)]
+struct RestorePlayback {
+    track_uri: String,
+    context_uri: Option<String>,
+    position_ms: u32,
+    start_playing: bool,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -93,6 +101,7 @@ struct Engine {
     oauth: SharedOAuth,
     session: Option<Session>,
     spirc: Option<Spirc>,
+    player: Option<Arc<Player>>,
     tasks: Vec<JoinHandle<()>>,
     state: Arc<Mutex<Playback>>,
     output: mpsc::UnboundedSender<Value>,
@@ -187,6 +196,7 @@ impl Engine {
             oauth,
             session: None,
             spirc: None,
+            player: None,
             tasks: vec![],
             state: Arc::new(Mutex::new(Playback::default())),
             output,
@@ -242,7 +252,14 @@ impl Engine {
             // failure exactly; Spirc reuses the same session's cached token.
             session.spclient().client_token().await?;
             attempt.stage = diagnostics::Stage::PlaybackSession;
-            Spirc::new(connect_config, session.clone(), credentials, player, mixer).await
+            Spirc::new(
+                connect_config,
+                session.clone(),
+                credentials,
+                player.clone(),
+                mixer,
+            )
+            .await
         })
         .await;
         let report = match &connection {
@@ -273,6 +290,9 @@ impl Engine {
             while let Some(event) = events.recv().await {
                 let mut snapshot = state.lock().unwrap();
                 let became_paused = should_trim_after_event(snapshot.is_playing, &event);
+                let position_confirmed = matches!(&event,
+                    PlayerEvent::Playing { .. } | PlayerEvent::Paused { .. } | PlayerEvent::PositionChanged { .. }
+                    | PlayerEvent::PositionCorrection { .. } | PlayerEvent::Seeked { .. });
                 match event {
                     PlayerEvent::Playing { track_id, position_ms, .. } => { snapshot.is_playing = true; snapshot.track_uri = Some(track_id.to_uri()); snapshot.position_ms = position_ms; }
                     PlayerEvent::Paused { track_id, position_ms, .. } => { snapshot.is_playing = false; snapshot.track_uri = Some(track_id.to_uri()); snapshot.position_ms = position_ms; }
@@ -289,12 +309,25 @@ impl Engine {
                         };
                     }
                     PlayerEvent::VolumeChanged { volume } => snapshot.volume_percent = Some(volume as f64 / u16::MAX as f64 * 100.0),
-                    PlayerEvent::Loading { track_id, position_ms, .. } => { snapshot.is_playing = false; snapshot.track_uri = Some(track_id.to_uri()); snapshot.position_ms = position_ms; snapshot.duration_ms = None; }
+                    PlayerEvent::Loading { track_id, position_ms, .. } => {
+                        let uri = track_id.to_uri();
+                        if snapshot.track_uri.as_deref() != Some(&uri) {
+                            snapshot.title = None;
+                            snapshot.artist = None;
+                            snapshot.image_url = None;
+                        }
+                        snapshot.is_playing = false;
+                        snapshot.track_uri = Some(uri);
+                        snapshot.position_ms = position_ms;
+                        snapshot.duration_ms = None;
+                    }
                     PlayerEvent::Stopped { .. } | PlayerEvent::EndOfTrack { .. } => snapshot.is_playing = false,
                     PlayerEvent::Unavailable { .. } => { snapshot.is_playing = false; let _ = output.send(json!({"event":"error","data":{"message":"Spotify could not load this track"}})); }
                     _ => continue,
                 }
-                let _ = output.send(json!({"event":"playback","data":*snapshot}));
+                let mut data = json!(*snapshot);
+                data["position_confirmed"] = json!(position_confirmed);
+                let _ = output.send(json!({"event":"playback","data":data}));
                 drop(snapshot);
                 if became_paused {
                     let state = state.clone();
@@ -322,6 +355,7 @@ impl Engine {
             json!({"connected":true,"username":session.username(),"device_id":self.device_id});
         self.session = Some(session);
         self.spirc = Some(spirc);
+        self.player = Some(player);
         Ok(result)
     }
 
@@ -335,7 +369,62 @@ impl Engine {
         for task in self.tasks.drain(..) {
             task.abort();
         }
+        self.player = None;
         *self.state.lock().unwrap() = Playback::default();
+    }
+
+    async fn restore_playback(&self, saved: RestorePlayback) -> Result<Value> {
+        let spirc = self.spirc.as_ref().context("Sign in with Spotify first")?;
+        let player = self.player.as_ref().context("Sign in with Spotify first")?;
+        let track = SpotifyUri::from_uri(&saved.track_uri).context("Invalid saved track URI")?;
+        if !matches!(track, SpotifyUri::Track { .. } | SpotifyUri::Episode { .. }) {
+            bail!("Unsupported saved track URI");
+        }
+        let options = LoadRequestOptions {
+            seek_to: saved.position_ms,
+            ..Default::default()
+        };
+        let context_load = if let Some(uri) = saved.context_uri {
+            let parsed = SpotifyUri::from_uri(&uri).context("Invalid saved collection URI")?;
+            if !matches!(
+                parsed,
+                SpotifyUri::Playlist { .. } | SpotifyUri::Album { .. } | SpotifyUri::Artist { .. }
+            ) {
+                bail!("Unsupported saved collection URI");
+            }
+            Some(LoadRequest::from_context_uri(
+                uri,
+                LoadRequestOptions {
+                    playing_track: Some(PlayingTrack::Uri(saved.track_uri.clone())),
+                    ..options.clone()
+                },
+            ))
+        } else {
+            None
+        };
+
+        spirc.activate()?;
+        let mut context_restored = false;
+        if let Some(load) = context_load {
+            context_restored = load_saved_track(spirc, player, load, &track).await?;
+        }
+        // A changed collection can resolve to its first song. Confirm the saved
+        // URI while paused before letting audio start.
+        if !context_restored
+            && !load_saved_track(
+                spirc,
+                player,
+                LoadRequest::from_tracks(vec![saved.track_uri], options),
+                &track,
+            )
+            .await?
+        {
+            bail!("Spotify could not restore the saved track");
+        }
+        if saved.start_playing {
+            spirc.play()?;
+        }
+        Ok(json!({"context_restored":context_restored}))
     }
 
     async fn authorization_token(
@@ -405,6 +494,14 @@ impl Engine {
         match request.method.as_str() {
             "authenticate" => return self.authenticate().await,
             "status" => return Ok(serde_json::to_value(&*self.state.lock().unwrap())?),
+            "restore" => {
+                return self
+                    .restore_playback(
+                        serde_json::from_value(request.params.clone())
+                            .context("Invalid playback checkpoint parameters")?,
+                    )
+                    .await;
+            }
             "trimMemory" => {
                 if self.state.lock().unwrap().is_playing {
                     bail!("Pause playback before releasing unused memory");
@@ -469,9 +566,79 @@ impl Engine {
     }
 }
 
+async fn load_saved_track(
+    spirc: &Spirc,
+    player: &Player,
+    load: LoadRequest,
+    track: &SpotifyUri,
+) -> Result<bool> {
+    let events = player.get_player_event_channel();
+    spirc.load(load)?;
+    Ok(
+        tokio::time::timeout(Duration::from_secs(15), confirm_saved_track(events, track))
+            .await
+            .unwrap_or(false),
+    )
+}
+
+async fn confirm_saved_track(mut events: PlayerEventChannel, track: &SpotifyUri) -> bool {
+    let mut active_request = None;
+    while let Some(event) = events.recv().await {
+        match event {
+            PlayerEvent::PlayRequestIdChanged { play_request_id } => {
+                active_request = Some(play_request_id)
+            }
+            _ if active_request.is_none() || event.get_play_request_id() != active_request => {
+                continue;
+            }
+            PlayerEvent::Paused { track_id, .. } => return &track_id == track,
+            PlayerEvent::Loading { track_id, .. } if &track_id != track => return false,
+            PlayerEvent::Unavailable { .. } => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn restore_requires_the_saved_track_in_the_current_paused_request() {
+        let saved = SpotifyUri::from_uri("spotify:track:0123456789abcdefghijkl").unwrap();
+        let other = SpotifyUri::from_uri("spotify:track:1123456789abcdefghijkl").unwrap();
+        let (sender, events) = mpsc::unbounded_channel();
+        for event in [
+            PlayerEvent::PlayRequestIdChanged { play_request_id: 2 },
+            PlayerEvent::Paused {
+                track_id: other.clone(),
+                play_request_id: 1,
+                position_ms: 0,
+            },
+            PlayerEvent::Paused {
+                track_id: saved.clone(),
+                play_request_id: 2,
+                position_ms: 15_000,
+            },
+        ] {
+            sender.send(event).unwrap();
+        }
+        assert!(confirm_saved_track(events, &saved).await);
+
+        let (sender, events) = mpsc::unbounded_channel();
+        sender
+            .send(PlayerEvent::PlayRequestIdChanged { play_request_id: 3 })
+            .unwrap();
+        sender
+            .send(PlayerEvent::Loading {
+                track_id: other,
+                play_request_id: 3,
+                position_ms: 15_000,
+            })
+            .unwrap();
+        assert!(!confirm_saved_track(events, &saved).await);
+    }
 
     #[test]
     fn initial_connect_volume_leaves_audio_unattenuated_before_playback() {
@@ -546,6 +713,7 @@ mod tests {
             ))),
             session: None,
             spirc: None,
+            player: None,
             tasks: vec![],
             state: Arc::new(Mutex::new(Playback::default())),
             output,

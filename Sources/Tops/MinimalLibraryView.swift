@@ -7,6 +7,7 @@ struct MinimalLibraryView: View {
     @Binding var selectedCollection: MusicItem?
     let openCollection: (MusicItem) -> Void
     let closeCollection: () -> Void
+    let togglePlaybackCollection: () -> Void
     var searchVisible = false
     var searchFocusRequest: NativeSearchField.FocusRequest? = nil
     var hideSearch: () -> Void = {}
@@ -68,6 +69,12 @@ struct MinimalLibraryView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityLabel(searchVisible ? "Search results" : "Sections and collections")
+
+            if model.nowPlaying != nil {
+                Rectangle().fill(palette.rule).frame(height: 1)
+                PlaybackBar(model: model, compact: true, selectedCollectionID: selectedCollection?.id,
+                            togglePlaylist: togglePlaybackCollection)
+            }
         }
         .frame(maxHeight: .infinity)
     }

@@ -27,6 +27,10 @@ Space controls the current song. Spaces typed into search remain ordinary text.
 Hover over a collection in the Text list to reveal its Play button on the right.
 This starts its queue without opening the detail; the button has its own space
 beside the text and also appears when either row action has keyboard focus.
+Both interfaces share transport, seeking and a list icon for the playing
+collection. Artwork shows the cover and a system volume slider. Text centers
+the title, artist and transport controls inside the narrow browsing column,
+even when the collection opens on the right.
 
 The original HTTP 403 was isolated to User-Agent filtering; adding the tested
 Spotify desktop User-Agent made the same saved-token request succeed. The app
@@ -43,6 +47,10 @@ reusing or refreshing saved credentials. When sign-in is needed, Spotify's own
 website opens in your browser; sign in and return to Tops. If the connection fails,
 choose **Connect Spotify** to retry. It requires Premium. There is no developer-dashboard
 registration or client secret to enter. Playback starts only when you choose music.
+On reopen, Tops shows your last track, playlist and saved position. Press Play
+to resume. The checkpoint is stored locally and separately for each signed-in
+account. A normal quit saves the latest confirmed position. During playback,
+Tops writes a checkpoint about every five seconds of progress.
 
 ```sh
 open dist/Tops.app

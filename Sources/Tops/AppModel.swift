@@ -47,7 +47,8 @@ final class AppModel: ObservableObject {
     @Published var nowPlaying: MusicItem? {
         didSet { updateMediaControls() }
     }
-    @Published private(set) var playbackCollectionID: String?
+    @Published private(set) var playbackCollection: MusicItem?
+    var playbackCollectionID: String? { playbackCollection?.id }
     @Published var status = "Connect to start listening"
 
     // Progress ticks only invalidate views observing playback, not the library.
@@ -78,6 +79,14 @@ final class AppModel: ObservableObject {
     }
     private var playbackRequestRevision = 0
     private var playbackTrackRevision = 0
+    private var playRequestInFlight = false
+    private var playbackPositionConfirmed = false
+    private var playbackContextURI: String?
+    private var checkpointURL: URL?
+    private var latestCheckpoint: PlaybackCheckpoint?
+    private var writtenCheckpoint: PlaybackCheckpoint?
+    private var pendingRestore: PlaybackCheckpoint?
+    private var restoringPlayback = false
     private lazy var collectionStore: CollectionStore = {
         if let suppliedCollectionStore { return suppliedCollectionStore }
         if let collectionLoader { return CollectionStore(directory: nil, loader: collectionLoader) }
@@ -157,6 +166,16 @@ final class AppModel: ObservableObject {
             // disk cache is loading advances again and must abort this connect.
             guard accountRevision == connectionRevision + 1 else { return }
             connected = true
+            if nowPlaying == nil, let checkpointURL, let checkpoint = PlaybackCheckpoint.read(from: checkpointURL) {
+                pendingRestore = checkpoint
+                latestCheckpoint = checkpoint
+                writtenCheckpoint = checkpoint
+                playbackContextURI = checkpoint.contextURI
+                nowPlaying = checkpoint.track
+                playback.update(isPlaying: false, positionMS: Double(checkpoint.positionMS),
+                                durationMS: Double(checkpoint.durationMS))
+                setPlaybackContext(checkpoint.collection)
+            }
             status = "Connected · this Mac"
             let revision = accountRevision
             let loaded = try await loadFeed()
@@ -205,13 +224,23 @@ final class AppModel: ObservableObject {
     func activateCollectionAccount(_ accountID: String?) async {
         clearAccountContent()
         if let accountID, !accountID.isEmpty {
+            checkpointURL = PlaybackCheckpoint.file(in: engine.dataDirectory, accountID: accountID)
             await collectionStore.activate(accountID: accountID)
         }
     }
 
     private func clearAccountContent() {
+        writePlaybackCheckpoint()
         accountRevision += 1
         playbackRequestRevision += 1
+        playRequestInFlight = false
+        playbackPositionConfirmed = false
+        playbackContextURI = nil
+        checkpointURL = nil
+        latestCheckpoint = nil
+        writtenCheckpoint = nil
+        pendingRestore = nil
+        restoringPlayback = false
         setPlaybackContext(nil)
         collectionStore.reset()
         invalidateSearch()
@@ -220,6 +249,7 @@ final class AppModel: ObservableObject {
         prefetchShelfCount = 6
         shelves = []
         nowPlaying = nil
+        playback.update(isPlaying: false, positionMS: 0, durationMS: 0)
         updateMediaControls()
     }
 
@@ -509,27 +539,33 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func setPlaybackContext(_ id: String?) {
-        if playbackCollectionID != id { playbackCollectionID = id }
+    private func setPlaybackContext(_ item: MusicItem?) {
+        if playbackCollection != item { playbackCollection = item }
         updateMediaControls()
     }
 
     func play(_ item: MusicItem, context: MusicItem? = nil) async {
-        guard connected else { return }
+        guard connected, !restoringPlayback else { return }
         playbackRequestRevision += 1
         let requestRevision = playbackRequestRevision
         let account = accountRevision
         let trackRevision = playbackTrackRevision
-        let context = context ?? (["playlist", "album", "artist"].contains(item.kind) ? item : nil)
+        let playsCollection = ["playlist", "album", "artist"].contains(item.kind)
+        let context = context ?? (playsCollection ? item : nil)
+        playRequestInFlight = true
+        defer { if requestRevision == playbackRequestRevision { playRequestInFlight = false } }
         do {
             _ = try await engine.call("play", ["uri": item.id])
             guard connected, account == accountRevision, requestRevision == playbackRequestRevision else { return }
             let trackChanged = trackRevision != playbackTrackRevision
+            pendingRestore = nil
+            playbackContextURI = playsCollection ? item.id : nil
             if !trackChanged {
                 if nowPlaying != item { nowPlaying = item }
                 playback.update(positionMS: 0, durationMS: 0)
             }
-            setPlaybackContext(context?.id)
+            setPlaybackContext(context)
+            if trackChanged { recordPlaybackCheckpoint() }
             updateMediaControls()
             error = nil
         } catch {
@@ -541,16 +577,67 @@ final class AppModel: ObservableObject {
     func togglePlayback() async { await command(playback.isPlaying ? "pause" : "resume") }
     func previous() async { await command("previous") }
     func next() async { await command("next") }
-    func seek(_ ms: Double) async { await command("seek", ["position_ms": max(0, Int(ms))]) }
+    func seek(_ ms: Double) async {
+        guard connected, !restoringPlayback, let position = UInt32(exactly: max(0, ms.rounded(.towardZero))) else { return }
+        if var checkpoint = pendingRestore {
+            checkpoint.positionMS = min(position, checkpoint.durationMS)
+            pendingRestore = checkpoint
+            latestCheckpoint = checkpoint
+            playback.update(positionMS: Double(checkpoint.positionMS))
+            updateMediaControls()
+            writePlaybackCheckpoint()
+        } else {
+            await command("seek", ["position_ms": position])
+        }
+    }
     func setVolume(_ value: Double) {
         do { try systemVolume.setVolume(value) }
         catch { self.error = error.localizedDescription }
     }
 
     private func command(_ method: String, _ params: [String: Any] = [:]) async {
-        guard connected else { return }
-        do { _ = try await engine.call(method, params); error = nil }
-        catch { self.error = error.localizedDescription }
+        guard connected, !restoringPlayback else { return }
+        let revision = accountRevision
+        do {
+            if let checkpoint = pendingRestore {
+                guard !playRequestInFlight, ["resume", "previous", "next"].contains(method) else { return }
+                restoringPlayback = true
+                defer { if revision == accountRevision { restoringPlayback = false } }
+                var restoreParams: [String: Any] = ["track_uri": checkpoint.track.id,
+                                                     "position_ms": checkpoint.positionMS,
+                                                     "start_playing": method == "resume"]
+                restoreParams["context_uri"] = checkpoint.contextURI
+                let result = try await engine.call("restore", restoreParams)
+                guard connected, revision == accountRevision else { return }
+                pendingRestore = nil
+                if result["context_restored"] as? Bool != true { playbackContextURI = nil }
+                recordPlaybackCheckpoint()
+                if method == "resume" { error = nil; return }
+            }
+            _ = try await engine.call(method, params)
+            if revision == accountRevision { error = nil }
+        } catch {
+            if revision == accountRevision { self.error = error.localizedDescription }
+        }
+    }
+
+    private func recordPlaybackCheckpoint() {
+        guard checkpointURL != nil, pendingRestore == nil, playbackPositionConfirmed, let track = nowPlaying,
+              let duration = UInt32(exactly: playback.durationMS), duration > 0,
+              let position = UInt32(exactly: playback.positionMS) else { return }
+        let checkpoint = PlaybackCheckpoint(track: track, collection: playbackCollection, contextURI: playbackContextURI,
+                                            positionMS: min(position, duration), durationMS: duration)
+        latestCheckpoint = checkpoint
+        let savedPosition = writtenCheckpoint?.positionMS ?? 0
+        if !playback.isPlaying || writtenCheckpoint?.track.id != track.id || writtenCheckpoint?.contextURI != playbackContextURI
+            || checkpoint.positionMS < savedPosition || checkpoint.positionMS - savedPosition >= 5_000 {
+            writePlaybackCheckpoint()
+        }
+    }
+
+    private func writePlaybackCheckpoint() {
+        guard let checkpointURL, let latestCheckpoint, latestCheckpoint != writtenCheckpoint else { return }
+        if (try? latestCheckpoint.write(to: checkpointURL)) != nil { writtenCheckpoint = latestCheckpoint }
     }
 
     func handleEvent(_ event: String, _ data: [String: Any]) {
@@ -561,12 +648,22 @@ final class AppModel: ObservableObject {
             status = "Disconnected"
         }
         if event == "playback" {
+            let uri = data["track_uri"] as? String
+            if let checkpoint = pendingRestore {
+                guard uri != nil, !restoringPlayback || uri == checkpoint.track.id else { return }
+                if !restoringPlayback, !playRequestInFlight, data["position_confirmed"] as? Bool == true {
+                    pendingRestore = nil
+                    playbackContextURI = nil
+                    setPlaybackContext(nil)
+                }
+            }
+            playbackPositionConfirmed = data["position_confirmed"] as? Bool == true
             playback.update(
                 isPlaying: data["is_playing"] as? Bool,
                 positionMS: data["position_ms"] as? Double,
                 durationMS: data["duration_ms"] as? Double
             )
-            if let uri = data["track_uri"] as? String {
+            if let uri {
                 // Even the same song is authoritative: another collection can
                 // start with it before its play request returns.
                 playbackTrackRevision += 1
@@ -584,6 +681,7 @@ final class AppModel: ObservableObject {
                         ?? MusicItem(id: uri, title: "Playing on this Mac", subtitle: "Spotify", imageURL: nil, kind: "track")
                 }
             }
+            if !playRequestInFlight { recordPlaybackCheckpoint() }
             updateMediaControls()
         }
         if event == "error", let message = data["message"] as? String { error = message }

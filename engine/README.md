@@ -43,6 +43,23 @@ Requests:
 
 `pause`, `resume`, `next` and `previous` take empty parameters. `play` also accepts Spotify album, artist, playlist and episode URIs. `seek` is absolute milliseconds. Mutation replies acknowledge queued commands; subsequent events establish actual playback.
 
+`restore` accepts `{track_uri, context_uri?, position_ms, start_playing}` after
+authentication. The app sends it on an explicit transport action after reconnecting.
+The helper uses `LoadRequestOptions` and `PlayingTrack::Uri` from the pinned
+librespot 0.8.0 Git revision `939dc5e`. It loads paused at the requested position,
+confirms the requested URI in the current `PlayerEvent::Paused`, then resumes if
+requested. The result `{context_restored}` reports whether the native collection
+was loaded. If the context cannot resolve the saved track, the helper tries that
+track on its own. A track unavailable in both loads returns an error. Duplicate
+track occurrences follow librespot's URI matching. This uses the same native
+session and credentials as `play`. See the [pinned load options](https://github.com/librespot-org/librespot/blob/939dc5ee9d833e1980f9495241219d9d4868a061/connect/src/model.rs),
+[Connect implementation](https://github.com/librespot-org/librespot/blob/939dc5ee9d833e1980f9495241219d9d4868a061/connect/src/spirc.rs)
+and [0.8.0 release notes](https://github.com/librespot-org/librespot/releases/tag/v0.8.0).
+The Rust test verifies confirmation of the saved track and rejection of a
+different track. Swift tests cover restart, checkpoint isolation by account,
+and standalone tracks. A native fixture exercised quit, reopen, Play and Next
+with a playlist. Live Spotify context resolution on restore remains unverified.
+
 Replies are `{"id":1,"result":{...}}` or `{"id":1,"error":"..."}`. Unknown or unauthenticated commands return an error. Malformed JSON uses `id:null`.
 
 `authenticate` reuses the saved OAuth grant when possible, otherwise opens
@@ -54,6 +71,11 @@ automatically take over playback from another device; `play` activates the local
 Tops device.
 
 `status` and `playback` events contain `{connected,is_playing,position_ms,track_uri?,duration_ms?,title?,artist?,image_url?,volume_percent?}`. Position events arrive once per second during playback. Other events are `authentication` with `{state:"waiting_for_browser"}`, `connection` with `{connected:false}`, and `error` with `{message}`. Internal volume starts at 100 percent (unity gain), leaving the app's slider to control macOS output volume. This must be set in `ConnectConfig`: librespot ignores queued `volume` commands until the device is active. The protocol's `volume` command remains available for active playback, including the live check's low-volume test.
+
+`playback` events also include `position_confirmed`, which distinguishes actual
+play, pause, seek and position notifications from loading or metadata changes.
+The Swift checkpoint only records confirmed positions with track metadata and
+a known duration. It keeps no credentials or audio.
 
 `partnerAuthContext` returns `{access_token,client_token,client_id,device_id,expires_at,token_kind:"desktop_oauth"}` for Pathfinder. Its bearer is the **original desktop OAuth grant**, refreshed when needed and paired with the session's existing client token. This is a first-party desktop grant, not a dashboard Web API grant.
 
